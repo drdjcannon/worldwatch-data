@@ -1,0 +1,85 @@
+# Mirrors the UCDP conflict record for the WorldWatch iOS app.
+#
+# The script and the published file live in the SAME repo on purpose: the
+# built-in GITHUB_TOKEN can then commit the result, so the only secret this
+# needs is the UCDP token itself. Pushing to a second repo would need a
+# fine-grained PAT as well, for no benefit.
+
+name: Mirror UCDP conflict data
+
+on:
+  schedule:
+    # Weekly, Mondays 06:00 UTC. UCDP publishes its GED Candidate release about
+    # monthly but not on a fixed day, so weekly polling picks a new release up
+    # within a week rather than up to a month late. One run is ~10 API requests
+    # against a 5,000/day quota, and a run whose output is byte-identical writes
+    # nothing and makes no commit.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+# Two concurrent runs would race on the commit. Never cancel in progress: a
+# half-finished run leaves the published file untouched, which is safe, but
+# there is no reason to discard a completed fetch.
+concurrency:
+  group: ucdp-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      OUT_PATH: ucdp/ucdp-events.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No dependencies, so this is a real test run and not a formality. It
+      # covers the fetch strategy against a fake UCDP, which is the only way any
+      # of it is verifiable without burning quota.
+      - name: Test the mirror logic
+        run: node --test tools/mirror-ucdp.test.mjs
+
+      - name: Build the mirror
+        env:
+          UCDP_ACCESS_TOKEN: ${{ secrets.UCDP_ACCESS_TOKEN }}
+        run: node tools/mirror-ucdp.mjs --out "${OUT_PATH}"
+
+      # `git status --porcelain` covers both a modified file and a brand-new one,
+      # which the script's own byte-identical check cannot (there is nothing to
+      # compare against on the first run).
+      - name: Publish if changed
+        run: |
+          git config user.name  'worldwatch-bot'
+          git config user.email 'worldwatch-bot@users.noreply.github.com'
+          if [ -z "$(git status --porcelain -- "${OUT_PATH}")" ]; then
+            echo 'No change in the UCDP record — nothing to publish.'
+            exit 0
+          fi
+          NEWEST=$(node -e "process.stdout.write(require('./${OUT_PATH}').newestEventAt)")
+          COUNT=$(node -e "process.stdout.write(String(require('./${OUT_PATH}').eventCount))")
+          git add "${OUT_PATH}"
+          git commit -m "UCDP: ${COUNT} events, newest ${NEWEST}"
+          git push
+
+      - name: Summarise
+        if: always()
+        run: |
+          if [ -f "${OUT_PATH}" ]; then
+            node -e "
+              const d = require('./${OUT_PATH}');
+              const lag = Math.round((Date.now() - Date.parse(d.newestEventAt)) / 86400000);
+              console.log('| field | value |');
+              console.log('|---|---|');
+              console.log('| annual release |', d.annualVersion, '|');
+              console.log('| candidate release |', d.candidateVersion ?? '(none)', '|');
+              console.log('| events |', d.eventCount, '(' + d.candidateEventCount + ' from candidate) |');
+              console.log('| content window |', d.oldestEventAt, '..', d.newestEventAt, '|');
+              console.log('| newest event age |', lag + ' days', lag > 90 ? '**candidate merge may be dead**' : '', '|');
+            " >> "${GITHUB_STEP_SUMMARY}"
+          fi
