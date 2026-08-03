@@ -1,16 +1,19 @@
 #!/usr/bin/env node
-// Tests for the UCDP mirror. Run: node --test tools/ucdp-mirror/
+// Tests for the UCDP mirror. Run: node --test tools/mirror-ucdp.test.mjs
 //
-// These matter more than usual: this machine cannot reach ucdpapi.pcr.uu.se at
-// all (the agent shell is domain-allowlisted), so a fake transport is the only
-// way to verify the fetch strategy before it runs for real in CI. Every case
-// below is a bug World Monitor actually hit.
+// These matter more than usual: this machine cannot reach ucdp.uu.se at all
+// (the agent shell is domain-allowlisted), so a fake transport is the only way
+// to verify the strategy before it runs for real in CI. Most cases below are a
+// bug World Monitor actually hit.
+//
+// The transport moved from the token-gated REST API to the published CSV
+// downloads on 2026-08-03. The version-probing and page-walking tests went with
+// it; everything about SHAPING the payload is unchanged and still tested here,
+// because none of that logic changed and all of it is load-bearing.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  buildAnnualVersions, buildCandidateVersions, capWithAnnualFloor, buildMirror,
-} from './mirror-ucdp.mjs';
+import { capWithAnnualFloor, buildMirror, parseCsv } from './mirror-ucdp.mjs';
 
 const DAY = 86_400_000;
 
@@ -30,60 +33,49 @@ function row(id, dateStart, extra = {}) {
   };
 }
 
-/**
- * Fake UCDP. `releases` maps version -> array of pages, each `{Result}`.
- * Records which (version, page) pairs were requested.
- */
-function fakeApi(releases, { fail = new Set() } = {}) {
-  const seen = [];
-  const fetchPage = async (version, page) => {
-    seen.push(`${version}:${page}`);
-    if (fail.has(`${version}:${page}`)) throw new Error('boom');
-    const pages = releases[version];
-    if (!pages) throw new Error(`HTTP 404 ${version}`);
-    const body = pages[page];
-    if (!body) throw new Error(`HTTP 404 ${version} p${page}`);
-    return { Result: body, TotalPages: pages.length };
-  };
-  return { fetchPage, seen };
+/** Fake downloads: hands `buildMirror` the parsed rows it would have fetched. */
+function fakeReleases(annual = [], candidate = []) {
+  return async () => ({ annual, candidate });
 }
 
-// ---- Version windows ----
+// ---- CSV parsing ----
+//
+// Hand-rolled because the repo has no dependencies, so it needs real coverage:
+// a naive split(',') passes a smoke test and then mangles most of the file.
 
-test('annual versions probe this year first, then fall back', () => {
-  assert.deepEqual(
-    buildAnnualVersions(new Date('2026-08-01T00:00:00Z')),
-    ['26.1', '25.1', '24.1'],
-  );
+test('parses a plain CSV into keyed rows', () => {
+  const rows = parseCsv('id,best\n123,5\n124,0\n');
+  assert.deepEqual(rows, [{ id: '123', best: '5' }, { id: '124', best: '0' }]);
 });
 
-test('candidate window is newest-first, current +1 through -4', () => {
-  // Mid-month on purpose. `buildCandidateVersions` reads `getMonth()`, which is
-  // LOCAL time (World Monitor's does too), so a UTC midnight on the 1st lands in
-  // the previous month west of Greenwich and makes the assertion zone-dependent.
-  // Being one month out is harmless by design — that is why the probe window is
-  // six wide rather than exact — but a test must not depend on the runner's zone.
-  assert.deepEqual(
-    buildCandidateVersions(new Date('2026-08-15T12:00:00Z')),
-    ['26.0.9', '26.0.8', '26.0.7', '26.0.6', '26.0.5', '26.0.4'],
-  );
+test('a quoted field may contain commas', () => {
+  // UCDP's source_article contains commas in almost every row.
+  const rows = parseCsv('id,source_article\n1,"Reuters, AFP, AP"\n');
+  assert.equal(rows[0].source_article, 'Reuters, AFP, AP');
 });
 
-test('candidate window rolls BACKWARD across the new year', () => {
-  // February 2026 must reach into 2025's releases, not ask for month -2.
-  assert.deepEqual(
-    buildCandidateVersions(new Date("2026-02-15T12:00:00Z")),
-    ['26.0.3', '26.0.2', '26.0.1', '25.0.12', '25.0.11', '25.0.10'],
-  );
+test('a doubled quote is an escaped quote', () => {
+  const rows = parseCsv('id,side_b\n1,"the ""Wagner"" group"\n');
+  assert.equal(rows[0].side_b, 'the "Wagner" group');
 });
 
-test('candidate window rolls FORWARD in December', () => {
-  // The bug this guards: month+1 = 13 was dropped entirely rather than rolling
-  // into next year, silently narrowing the window to 5 every December.
-  const versions = buildCandidateVersions(new Date("2026-12-10T12:00:00Z"));
-  assert.equal(versions.length, 6, 'December must still probe 6 versions');
-  assert.equal(versions[0], '27.0.1');
-  assert.deepEqual(versions, ['27.0.1', '26.0.12', '26.0.11', '26.0.10', '26.0.9', '26.0.8']);
+test('a quoted field may contain newlines', () => {
+  // This is the one that breaks line-based parsers: the record spans two lines.
+  const rows = parseCsv('id,source_article\n1,"line one\nline two"\n2,x\n');
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].source_article, 'line one\nline two');
+  assert.equal(rows[1].id, '2');
+});
+
+test('CRLF line endings and a missing final newline both parse', () => {
+  const rows = parseCsv('id,best\r\n1,5\r\n2,6');
+  assert.deepEqual(rows.map((r) => r.id), ['1', '2']);
+});
+
+test('a truncated row is dropped rather than mis-keyed', () => {
+  // A file cut off mid-write would otherwise shift every column right.
+  const rows = parseCsv('id,best,country\n1,5,Sudan\n2,6\n');
+  assert.deepEqual(rows.map((r) => r.id), ['1']);
 });
 
 // ---- Cap ----
@@ -118,133 +110,92 @@ test('cap is a no-op below the ceiling', () => {
   assert.deepEqual(capWithAnnualFloor(events, () => false, 2000, 500), events);
 });
 
-// ---- Fetch strategy ----
-
-test('fetches the NEWEST annual pages, never page 0 alone', async () => {
-  // The bug in the app's old feed: page=0 of a 418k-row release is the OLDEST
-  // rows. The newest data lives on the last page.
-  const pages = Array.from({ length: 20 }, (_u, p) => [row(`p${p}`, '2025-06-01')]);
-  const { fetchPage, seen } = fakeApi({ '26.1': pages });
-
-  await buildMirror({ fetchPage, now: new Date('2026-08-01T00:00:00Z') });
-
-  // Discovery reads page 0; the payload comes from pages 19..14.
-  for (const page of [19, 18, 17, 16, 15, 14]) {
-    assert.ok(seen.includes(`26.1:${page}`), `expected page ${page} to be fetched`);
-  }
-  assert.ok(!seen.includes('26.1:1'), 'must not walk forward from the oldest end');
-});
+// ---- Merge and dedupe ----
 
 test('candidate is merged ON TOP of annual, never replacing it', async () => {
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({
-    // Annual: 400 older events, one page.
-    '26.1': [Array.from({ length: 400 }, (_u, i) => row(`a${i}`, day(anchor, 200)))],
-    // Candidate for last month.
-    '26.0.7': [Array.from({ length: 50 }, (_u, i) => row(`c${i}`, day(anchor, 20)))],
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 100))], [row('c1', day(anchor, 5))]),
   });
 
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
-  assert.equal(out.candidateVersion, '26.0.7');
-  assert.equal(out.candidateComplete, true);
-  assert.equal(out.eventCount, 450, 'annual must survive the merge');
-  assert.equal(out.candidateEventCount, 50);
+  assert.deepEqual(out.events.map((e) => e.id).sort(), ['a1', 'c1']);
+  assert.equal(out.candidateEventCount, 1);
 });
 
 test('a candidate revision of an annual event wins the dedupe', async () => {
+  // Same id in both releases: the candidate is the fresher coding.
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({
-    '26.1': [[row('shared', day(anchor, 100), { best: 5 })]],
-    '26.0.7': [[row('shared', day(anchor, 100), { best: 42 })]],
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases(
+      [row('shared', day(anchor, 50), { best: 5 })],
+      [row('shared', day(anchor, 50), { best: 99 })]),
   });
 
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
-  assert.equal(out.eventCount, 1);
-  assert.equal(out.events[0].best, 42, 'the fresher candidate coding must win');
+  assert.equal(out.events.length, 1);
+  assert.equal(out.events[0].best, 99, 'the candidate revision must win');
 });
 
-test('missing candidate is not an error', async () => {
+test('a missing candidate is not an error', async () => {
+  // The candidate improves recency; the annual base IS the data.
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({ '26.1': [[row('a1', day(anchor, 30))]] });
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 30))], []),
+  });
 
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
+  assert.equal(out.eventCount, 1);
   assert.equal(out.candidateVersion, null);
   assert.equal(out.candidateComplete, false);
-  assert.equal(out.eventCount, 1);
 });
 
-test('a partial candidate is labelled partial', async () => {
-  const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({
-    '26.1': [[row('a1', day(anchor, 30))]],
-    '26.0.7': [[row('c1', day(anchor, 5))], [row('c2', day(anchor, 6))]],
-  }, { fail: new Set(['26.0.7:1']) });
-
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
-  assert.equal(out.candidateVersion, '26.0.7+partial',
-    'a partial fetch must not claim the bare version');
-  assert.equal(out.candidateComplete, false);
-});
-
-// ---- The window anchor: the whole reason conflict data shows up at all ----
+// ---- The window ----
 
 test('the 1-year window is anchored to the DATASET, not to now', async () => {
+  // The single most important behaviour here. The annual release is ~7 months
+  // stale by design, so a window measured from today discards all of it.
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  // A realistically lagged annual release: newest event 7 months old, and a
-  // year of history behind it. Measured from `now`, the 300-day-old rows would
-  // all be discarded and the payload would be nearly empty.
-  const { fetchPage } = fakeApi({
-    '26.1': [[
-      row('newest', day(anchor, 210)),
-      row('mid', day(anchor, 400)),
-      row('oldish', day(anchor, 500)),
-      row('tooOld', day(anchor, 600)),   // >365d before `newest` — must drop
-    ]],
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([
+      row('recent', day(anchor, 200)),     // 6+ months old, must survive
+      row('ancient', day(anchor, 900)),    // outside a year of the newest
+    ], []),
   });
 
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
-  const ids = out.events.map((e) => e.id);
-  assert.deepEqual(ids, ['newest', 'mid', 'oldish'],
-    'window must run 365d back from the newest EVENT, not from today');
-  assert.ok(!ids.includes('tooOld'));
-});
-
-test('events are sorted newest-first and dates reported', async () => {
-  const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({
-    '26.1': [[row('old', day(anchor, 300)), row('new', day(anchor, 10))]],
-  });
-
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-
-  assert.deepEqual(out.events.map((e) => e.id), ['new', 'old']);
-  assert.equal(out.newestEventAt, day(anchor, 10));
-  assert.equal(out.oldestEventAt, day(anchor, 300));
+  assert.deepEqual(out.events.map((e) => e.id), ['recent']);
 });
 
 test('undated rows are dropped rather than placed at the epoch', async () => {
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({
-    '26.1': [[row('good', day(anchor, 10)), row('undated', '')]],
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('good', day(anchor, 10)), row('undated', '')], []),
   });
-
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
 
   assert.deepEqual(out.events.map((e) => e.id), ['good']);
 });
 
+test('events are sorted newest-first and the content dates are reported', async () => {
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases(
+      [row('older', day(anchor, 200)), row('newer', day(anchor, 20))], []),
+  });
+
+  assert.deepEqual(out.events.map((e) => e.id), ['newer', 'older']);
+  assert.equal(out.newestEventAt, day(anchor, 20));
+  assert.equal(out.oldestEventAt, day(anchor, 200));
+});
+
 // ---- Refusing to publish bad data ----
 
-test('refuses to publish when every annual page failed', async () => {
-  const { fetchPage } = fakeApi({ '26.1': [[]] });   // discovery finds nothing
+test('refuses to publish when the annual release is empty', async () => {
   await assert.rejects(
-    buildMirror({ fetchPage, now: new Date('2026-08-01T00:00:00Z') }),
-    /No published UCDP annual release/,
+    buildMirror({ now: new Date('2026-08-01T00:00:00Z'), fetch: fakeReleases([], []) }),
+    /annual release is empty/,
   );
 });
 
@@ -253,46 +204,25 @@ test('refuses to publish a candidate-only payload over good annual data', async 
   // fires on the final count, so a healthy candidate masks a dead annual base
   // and the run overwrites last-good history with a thin release.
   const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const releases = {
-    '26.1': [Array.from({ length: 3 }, (_u, p) => row(`a${p}`, day(anchor, 100)))],
-    '26.0.7': [[row('c1', day(anchor, 5))]],
-  };
-  // Page 0 answers during discovery but the payload fetch of that same page fails.
-  let discovered = false;
-  const fetchPage = async (version, page) => {
-    if (version === '26.1' && page === 0) {
-      if (!discovered) { discovered = true; return { Result: releases['26.1'][0], TotalPages: 1 }; }
-      throw new Error('boom');
-    }
-    const pages = releases[version];
-    if (!pages?.[page]) throw new Error('HTTP 404');
-    return { Result: pages[page], TotalPages: pages.length };
-  };
-
-  // Discovery's page0 is reused for the payload, so this specific shape still
-  // succeeds — the guard is verified by the all-empty case below.
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
-  assert.ok(out.eventCount >= 3, 'annual rows must be present, not replaced');
-});
-
-test('refuses to publish when the annual base is empty but a candidate exists', async () => {
-  const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const fetchPage = async (version, page) => {
-    // Annual discovery succeeds with rows, but every payload page comes back empty.
-    if (version === '26.1') return { Result: [], TotalPages: 1 };
-    throw new Error('HTTP 404');
-  };
   await assert.rejects(
-    buildMirror({ fetchPage, now: new Date(anchor) }),
-    /No published UCDP annual release/,
+    buildMirror({
+      now: new Date(anchor),
+      fetch: fakeReleases([], [row('c1', day(anchor, 5))]),
+    }),
+    /annual release is empty/,
   );
 });
 
-test('payload keeps UCDP field names so the app decoder is unchanged', async () => {
-  const anchor = Date.parse('2026-08-01T00:00:00Z');
-  const { fetchPage } = fakeApi({ '26.1': [[row('a1', day(anchor, 10))]] });
+// ---- The app's contract ----
 
-  const out = await buildMirror({ fetchPage, now: new Date(anchor) });
+test('payload keeps UCDP field names so the app decoder is unchanged', async () => {
+  // The whole point of the CSV move being transport-only: a shipped build must
+  // keep reading the file without a schema bump.
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 10))], []),
+  });
 
   assert.deepEqual(Object.keys(out.events[0]).sort(), [
     'best', 'country', 'date_end', 'date_start', 'high', 'id', 'latitude',
@@ -301,4 +231,26 @@ test('payload keeps UCDP field names so the app decoder is unchanged', async () 
   ]);
   assert.equal(out.schema, 1);
   assert.match(out.attribution, /Uppsala/);
+  assert.match(out.attribution, /CC BY 4\.0/);
+});
+
+test('CSV strings are coerced to the numeric types the app expects', async () => {
+  // Every CSV value arrives as a string. The app decodes latitude, best and
+  // type_of_violence as numbers, so slim() must convert rather than pass through.
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 10), {
+      latitude: '15.5', longitude: '30.2', best: '7', low: '4', high: '9',
+      type_of_violence: '1',
+    })], []),
+  });
+
+  const event = out.events[0];
+  assert.equal(typeof event.latitude, 'number');
+  assert.equal(event.latitude, 15.5);
+  assert.equal(typeof event.best, 'number');
+  assert.equal(event.best, 7);
+  assert.equal(typeof event.type_of_violence, 'number');
+  assert.equal(event.id, 'a1', 'id stays a string');
 });

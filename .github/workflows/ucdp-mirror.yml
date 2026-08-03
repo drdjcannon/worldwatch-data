@@ -1,9 +1,13 @@
 # Mirrors the UCDP conflict record for the WorldWatch iOS app.
 #
 # The script and the published file live in the SAME repo on purpose: the
-# built-in GITHUB_TOKEN can then commit the result, so the only secret this
-# needs is the UCDP token itself. Pushing to a second repo would need a
-# fine-grained PAT as well, for no benefit.
+# built-in GITHUB_TOKEN can then commit the result. Pushing to a second repo
+# would need a fine-grained PAT, for no benefit.
+#
+# NO SECRETS AT ALL. This used to carry UCDP_ACCESS_TOKEN for their REST API,
+# which 401s without one. UCDP also publishes the same data as static CSV
+# downloads under CC BY 4.0 with no credential, so the script fetches those
+# instead and the workflow needs nothing configured to run.
 
 name: Mirror UCDP conflict data
 
@@ -11,9 +15,9 @@ on:
   schedule:
     # Weekly, Mondays 06:00 UTC. UCDP publishes its GED Candidate release about
     # monthly but not on a fixed day, so weekly polling picks a new release up
-    # within a week rather than up to a month late. One run is ~10 API requests
-    # against a 5,000/day quota, and a run whose output is byte-identical writes
-    # nothing and makes no commit.
+    # within a week rather than up to a month late. One run is two file
+    # downloads with no quota attached, and a run whose output is byte-identical
+    # writes nothing and makes no commit.
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
@@ -46,8 +50,6 @@ jobs:
         run: node --test tools/mirror-ucdp.test.mjs
 
       - name: Build the mirror
-        env:
-          UCDP_ACCESS_TOKEN: ${{ secrets.UCDP_ACCESS_TOKEN }}
         run: node tools/mirror-ucdp.mjs --out "${OUT_PATH}"
 
       # `git status --porcelain` covers both a modified file and a brand-new one,

@@ -1,63 +1,84 @@
 #!/usr/bin/env node
 'use strict';
 
-// UCDP mirror. Fetches the Uppsala Conflict Data Program's Georeferenced Event
+// UCDP mirror. Downloads the Uppsala Conflict Data Program's Georeferenced Event
 // Dataset and writes a slimmed JSON file the iOS app can read with no
 // credentials of its own.
 //
 // WHY THIS EXISTS
 //
-// UCDP's API needs an `x-ucdp-access-token`, and the only way to get one is to
-// email their maintainer. That is fine for one operator and hopeless for an App
-// Store audience: shipping the token in the binary makes it extractable and
-// puts every install on one 5,000-request/day quota, and asking each user to
-// email Uppsala means nobody ever sees conflict data.
+// Two problems, one solution. UCDP's REST API needs an `x-ucdp-access-token`
+// obtainable only by emailing their maintainer — confirmed 2026-08-03, when an
+// unauthenticated run answered `401 "API token required"` for every one of
+// v26.1, v25.1 and v24.1. That is fine for one operator and hopeless for an App
+// Store audience: shipping a token in the binary makes it extractable and puts
+// every install on one quota, and asking each user to email Uppsala means
+// nobody ever sees conflict data.
 //
-// So this mirrors World Monitor's own architecture. There, a seeder holds one
-// token, writes to Redis, and clients read the result — they never talk to UCDP.
-// Here a scheduled GitHub Action plays the seeder, the token lives as a repo
-// secret, and the output is a static JSON file. Zero infrastructure, zero cost,
-// no token on any device.
+// So a scheduled GitHub Action plays the seeder and the output is a static JSON
+// file. Zero infrastructure, zero cost, no token on any device.
 //
-// UCDP GED is released under CC BY 4.0, so redistributing it is fine; the
-// attribution the app already carries (`SourceID.attribution`) is the condition.
+// WHY NOT THE API AT ALL
 //
-// WHAT IT PORTS
+// Because it turns out we never needed it. UCDP publishes the *same data* as
+// static CSV downloads at ucdp.uu.se/downloads, with no token, no login and no
+// rate limit — and states outright that everything there is "free of charge and
+// licensed under CC BY 4.0 — you are free to use and redistribute them provided
+// you cite the relevant publications". So redistribution is explicitly granted
+// rather than merely tolerated, which was the one legal question hanging over
+// this mirror.
 //
-// The fetch strategy is a direct port of worldmonitor's
-// `scripts/seed-ucdp-events.mjs` plus `scripts/shared/ucdp-candidate.cjs`. Every
-// non-obvious part of it is load-bearing and was learned the hard way over
-// there; the comments say which.
+// This is the same lesson as GDELT: the bulk export was the real path there
+// too, and the rate-limited API was the fallback we had mistaken for primary.
+//
+// WHAT IS PORTED, AND WHAT IS NOT
+//
+// Only the TRANSPORT changed. Every shaping decision below is still a direct
+// port of worldmonitor's `scripts/seed-ucdp-events.mjs` and
+// `scripts/shared/ucdp-candidate.cjs`: the candidate-on-top merge, the dedupe,
+// the dataset-anchored window, the annual floor, and the slimming. Each was
+// learned the hard way over there and the comments say which.
+//
+// Dropped with the API: token handling, page walking, and version probing. The
+// download URLs carry their version in the path, so a new release is a one-line
+// edit rather than a speculative probe — and a 404 is then a loud failure
+// instead of a silent fallback to last year's data.
 //
 // Usage:
-//   UCDP_ACCESS_TOKEN=… node mirror-ucdp.mjs --out ucdp-events.json
+//   node mirror-ucdp.mjs --out ucdp-events.json
 //   node mirror-ucdp.mjs --out /tmp/x.json --dry-run
 
-import { writeFileSync, readFileSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
 
-// ---- Constants (transcribed from World Monitor, not re-tuned) ----
-
-const API_BASE = 'https://ucdpapi.pcr.uu.se/api/gedevents';
-const PAGE_SIZE = 1000;
-
-/** Annual pages to pull. 6 x 1000 newest-first covers a year comfortably. */
-const ANNUAL_MAX_PAGES = 6;
+// ---- Constants ----
 
 /**
- * A candidate release is far thinner than the annual (26.0.6 was 1,795 events
- * across 2 pages), so 3 pages covers a whole one with room to spare. It is a
- * bound, not an assumption: truncation is reported, never silent.
+ * The two published downloads. Both keyless.
+ *
+ * The annual GED is the base: ~418k events back to 1989, finalised once a year.
+ * The candidate is the recency half — UCDP promises "not more than a month's
+ * lag globally" for it, against the annual's ~7 months — and is an ADDITION on
+ * top, never a replacement.
+ *
+ * Versions live in the URL rather than being probed. With the API a wrong guess
+ * fell back to an older release and published stale data quietly; here a bump
+ * UCDP has made and we have not is a 404, which fails the run loudly. Check
+ * ucdp.uu.se/downloads when that happens.
+ *
+ * The cumulative Jan-Jun candidate is used rather than the single-month file:
+ * one request then covers the whole year to date.
  */
-const CANDIDATE_MAX_PAGES = 3;
+const ANNUAL_URL = 'https://ucdp.uu.se/downloads/ged/ged261-csv.zip';
+const ANNUAL_VERSION = '26.1';
+const CANDIDATE_URL =
+  'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv';
+const CANDIDATE_VERSION = '26.01.26.06';
 
-/**
- * Candidate discovery fires six speculative probes, most of which 4xx for a
- * not-yet-published version, so it gets a much shorter budget than a real page
- * fetch (a 1,000-row page of a 418k-row release is genuinely slow).
- */
-const CANDIDATE_DISCOVER_TIMEOUT_MS = 15_000;
-const PAGE_TIMEOUT_MS = 90_000;
+/** The annual zip is ~50 MB, so this is generous on purpose. */
+const DOWNLOAD_TIMEOUT_MS = 180_000;
 
 /** Payload guard. Matches World Monitor's cap so the two carry the same depth. */
 const MAX_EVENTS = 2000;
@@ -90,160 +111,118 @@ const TRAILING_WINDOW_MS = 365 * 24 * 60 * 60 * 1000;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
   + '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// ---- Version discovery ----
-
-/**
- * Annual releases are `${YY}.1`. Probed rather than hardcoded so a bump is a
- * skipped probe instead of an outage; the older fallbacks are there because a
- * new year's release does not exist until UCDP publishes it.
- */
-export function buildAnnualVersions(now = new Date()) {
-  const yy = now.getFullYear() - 2000;
-  return [...new Set([`${yy}.1`, `${yy - 1}.1`, '25.1', '24.1'])];
-}
-
-/**
- * Monthly GED Candidate releases, `${YY}.0.${M}`, newest-first, current +1
- * through -4.
- *
- * The candidate is the recency story: UCDP promises "not more than a month's
- * lag globally" for it, against the annual release's ~7 months. It is an
- * ADDITION on top of the annual base, never a replacement — a candidate alone is
- * ~1.8k events against the annual's ~418k.
- */
-export function buildCandidateVersions(now = new Date()) {
-  const yy = now.getFullYear() - 2000;
-  const month = now.getMonth() + 1;
-  const out = [];
-  for (let offset = 1; offset >= -4; offset--) {
-    const m = month + offset;
-    if (m >= 1 && m <= 12) out.push(`${yy}.0.${m}`);
-    else if (m < 1) out.push(`${yy - 1}.0.${m + 12}`);
-    // Rolling FORWARD into next year matters too. Without this branch the entry
-    // was dropped outright, silently narrowing the window to 5 every December.
-    else out.push(`${yy + 1}.0.${m - 12}`);
-  }
-  return out;
-}
-
 // ---- Transport ----
 
-function hasResults(page) {
-  return Array.isArray(page?.Result) && page.Result.length > 0;
-}
-
-function makeFetchPage(token, log) {
-  return async function fetchPage(version, page, timeoutMs = PAGE_TIMEOUT_MS) {
-    const headers = { Accept: 'application/json', 'User-Agent': UA };
-    // Forwarded only when present, so an unauthenticated run still works if
-    // UCDP ever relaxes the requirement. It currently answers
-    // 401 "API token required. Add header: x-ucdp-access-token: <your-token>".
-    if (token) headers['x-ucdp-access-token'] = token;
-
-    const url = `${API_BASE}/${version}?pagesize=${PAGE_SIZE}&page=${page}`;
-    const resp = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
-    if (!resp.ok) {
-      // Read the body. UCDP explains itself there and the status alone sends you
-      // guessing — this is the same lesson `FeedHTTP` logs for in the app.
-      const body = await resp.text().catch(() => '');
-      throw new Error(`${version} p${page}: HTTP ${resp.status} ${body.slice(0, 160)}`);
-    }
-    return resp.json();
-  };
-}
-
-/** Sequential: the first version with results is the newest available. */
-async function discoverAnnual(fetchPage, candidates, log) {
-  for (const version of candidates) {
-    try {
-      const page0 = await fetchPage(version, 0);
-      if (!hasResults(page0)) { log(`  v${version}: empty`); continue; }
-      log(`  annual v${version}: ${page0.Result.length} rows on page 0, `
-        + `${page0.TotalPages} pages`);
-      return { version, page0 };
-    } catch (err) {
-      log(`  v${version} failed: ${err.message}`);
-    }
-  }
-  throw new Error('No published UCDP annual release found');
-}
-
 /**
- * Probes every candidate CONCURRENTLY and takes the newest that answered.
- * `buildCandidateVersions` is newest-first, so the first fulfilled probe is by
- * construction the newest — no version comparator needed.
+ * Download a URL as a Buffer, failing loudly with the response body.
  *
- * Returns null rather than throwing when nothing is published yet: the candidate
- * is an addition, so its absence is not an error.
+ * The body matters: UCDP explains itself there, and a bare status code is what
+ * turned the token question into a guessing game in the first place.
  */
-async function discoverCandidate(fetchPage, candidates, log) {
-  const settled = await Promise.allSettled(candidates.map(async (version) => {
-    const first = await fetchPage(version, 0, CANDIDATE_DISCOVER_TIMEOUT_MS);
-    if (!hasResults(first)) throw new Error(`${version}: no results`);
-    return { version, first };
-  }));
-  for (const outcome of settled) {
-    if (outcome.status === 'fulfilled') return outcome.value;
+async function download(url, label) {
+  const resp = await fetch(url, {
+    headers: { 'User-Agent': UA, Accept: '*/*' },
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`${label}: HTTP ${resp.status} ${body.slice(0, 160)}`);
   }
-  log('  no candidate release published this cycle — annual only');
-  return null;
+  return Buffer.from(await resp.arrayBuffer());
 }
 
 /**
- * Fetch a set of pages, isolating per-page failures so one bad page cannot
- * truncate the rest. Reports `complete` and `truncated` separately, because a
- * partial release labelled as a complete one is indistinguishable downstream.
- */
-async function fetchPages(fetchPage, version, first, totalPages, maxPages) {
-  const wanted = Math.min(Math.max(1, totalPages), maxPages);
-  const FAILED = Symbol('failed');
-  const rest = await Promise.all(
-    Array.from({ length: Math.max(0, wanted - 1) }, (_unused, i) =>
-      fetchPage(version, i + 1).catch(() => FAILED)),
-  );
-  const events = Array.isArray(first?.Result) ? [...first.Result] : [];
-  let failedPages = 0;
-  for (const page of rest) {
-    if (page === FAILED) { failedPages++; continue; }
-    if (Array.isArray(page?.Result)) events.push(...page.Result);
-  }
-  return {
-    events,
-    failedPages,
-    complete: failedPages === 0,
-    truncated: totalPages > maxPages,
-  };
-}
-
-/**
- * Annual pages, NEWEST FIRST.
+ * Extract the first CSV member of a zip, using the platform `unzip`.
  *
- * The app's old feed asked for `page=0` of the annual release, which is the
- * OLDEST 100 rows of a ~418k-row dataset — years-stale events presented as the
- * conflict record. The newest data is on the LAST page, so walk down from
- * `totalPages - 1`.
+ * Node has no built-in zip reader and this repo deliberately has no
+ * dependencies — the workflow runs `node --test` with nothing installed, which
+ * is what makes it cheap and unbreakable. `unzip` is present on every GitHub
+ * runner image.
  */
-async function fetchAnnualNewest(fetchPage, version, page0, totalPages, log) {
-  const newest = Math.max(0, totalPages - 1);
-  const FAILED = Symbol('failed');
-  const wanted = [];
-  for (let offset = 0; offset < ANNUAL_MAX_PAGES && (newest - offset) >= 0; offset++) {
-    const page = newest - offset;
-    wanted.push(page === 0
-      ? Promise.resolve(page0)
-      : fetchPage(version, page).catch(() => FAILED));
+function unzipFirstCsv(buffer, log) {
+  const tmp = join(tmpdir(), `ucdp-annual-${process.pid}.zip`);
+  const dir = join(tmpdir(), `ucdp-annual-${process.pid}`);
+  writeFileSync(tmp, buffer);
+  mkdirSync(dir, { recursive: true });
+  execFileSync('unzip', ['-o', '-q', tmp, '-d', dir]);
+
+  const csv = readdirSync(dir).find((name) => name.toLowerCase().endsWith('.csv'));
+  if (!csv) throw new Error(`no CSV inside ${ANNUAL_URL}`);
+  log(`  unzipped ${csv}`);
+  const text = readFileSync(join(dir, csv), 'utf8');
+  rmSync(tmp, { force: true });
+  rmSync(dir, { recursive: true, force: true });
+  return text;
+}
+
+/**
+ * Parse RFC 4180 CSV into row objects keyed by header.
+ *
+ * Hand-rolled because the repo has no dependencies, and a naive `split(',')`
+ * is not an option here: UCDP's `source_article` field contains commas,
+ * embedded quotes and newlines in almost every row. Handles quoted fields,
+ * doubled quotes as an escape, and CRLF.
+ */
+export function parseCsv(text) {
+  const rows = [];
+  let field = '';
+  let record = [];
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+    if (quoted) {
+      if (char === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else quoted = false;
+      } else field += char;
+      continue;
+    }
+    if (char === '"') { quoted = true; continue; }
+    if (char === ',') { record.push(field); field = ''; continue; }
+    if (char === '\r') continue;
+    if (char === '\n') { record.push(field); rows.push(record); field = ''; record = []; continue; }
+    field += char;
   }
-  const results = await Promise.all(wanted);
-  const events = [];
-  let failedPages = 0;
-  for (const page of results) {
-    if (page === FAILED) { failedPages++; continue; }
-    if (Array.isArray(page?.Result)) events.push(...page.Result);
+  // A file not ending in a newline still has a final record.
+  if (field !== '' || record.length) { record.push(field); rows.push(record); }
+
+  const header = rows.shift();
+  if (!header) return [];
+  return rows
+    // Trailing blank line, and any row the file truncated mid-write.
+    .filter((cells) => cells.length === header.length)
+    .map((cells) => {
+      const out = {};
+      for (let i = 0; i < header.length; i++) out[header[i]] = cells[i];
+      return out;
+    });
+}
+
+/**
+ * Fetch both releases. Injectable so the tests can run without network — the
+ * agent shell cannot reach ucdp.uu.se at all.
+ *
+ * Returns `candidate: []` rather than throwing when the candidate is
+ * unavailable: it improves recency, but the annual base IS the data.
+ */
+async function fetchReleases(log) {
+  log(`annual ${ANNUAL_VERSION}:`);
+  const zip = await download(ANNUAL_URL, `annual ${ANNUAL_VERSION}`);
+  log(`  downloaded ${(zip.length / 1_048_576).toFixed(1)} MB`);
+  const annual = parseCsv(unzipFirstCsv(zip, log));
+  log(`  parsed ${annual.length} rows`);
+
+  log(`candidate ${CANDIDATE_VERSION}:`);
+  let candidate = [];
+  try {
+    const csv = await download(CANDIDATE_URL, `candidate ${CANDIDATE_VERSION}`);
+    candidate = parseCsv(csv.toString('utf8'));
+    log(`  parsed ${candidate.length} rows`);
+  } catch (err) {
+    log(`  skipped: ${err.message}`);
   }
-  log(`  annual: ${events.length} rows from pages ${newest}..`
-    + `${Math.max(0, newest - ANNUAL_MAX_PAGES + 1)}`
-    + (failedPages ? ` (${failedPages} page(s) failed)` : ''));
-  return { events, failedPages };
+  return { annual, candidate };
 }
 
 // ---- Shaping ----
@@ -332,20 +311,18 @@ function parseArgs(argv) {
 }
 
 /**
- * @param fetchPage injectable transport `(version, page, timeoutMs) => Promise<{Result, TotalPages}>`.
- *   Defaults to the real API. Injected by `mirror-ucdp.test.mjs`, which is the
- *   only way any of this is verifiable without a token and network access.
+ * Build the mirror payload from the two published CSV releases.
+ *
+ * @param fetch injectable transport returning `{annual, candidate}` arrays of
+ *   raw CSV row objects. Defaults to the real downloads. Injected by
+ *   `mirror-ucdp.test.mjs`, which is the only way any of this is verifiable:
+ *   the agent shell cannot reach ucdp.uu.se at all.
  */
-export async function buildMirror({ token, now = new Date(), log = () => {}, fetchPage } = {}) {
-  fetchPage = fetchPage ?? makeFetchPage(token, log);
+export async function buildMirror({ now = new Date(), log = () => {}, fetch } = {}) {
+  const load = fetch ?? (() => fetchReleases(log));
+  const { annual, candidate } = await load();
 
-  log('annual release:');
-  const { version, page0 } = await discoverAnnual(fetchPage, buildAnnualVersions(now), log);
-  const totalPages = Math.max(1, Number(page0?.TotalPages) || 1);
-
-  const annual = await fetchAnnualNewest(fetchPage, version, page0, totalPages, log);
-
-  // Preserve last-good data when the annual base could not be fetched AT ALL.
+  // Preserve last-good data when the annual base is missing.
   //
   // This MUST come BEFORE the candidate merge. An empty-payload guard placed
   // after it fires on the FINAL count, so a healthy candidate refilling the
@@ -353,51 +330,27 @@ export async function buildMirror({ token, now = new Date(), log = () => {}, fet
   // publishes a thin candidate-only release over good data, evicting the history
   // the classifier needs. World Monitor's relay always had this ordering; its
   // backup cron did not, and that was the bug.
-  if (annual.events.length === 0) {
-    throw new Error('every annual page failed — refusing to publish, keeping last good file');
+  if (annual.length === 0) {
+    throw new Error('annual release is empty — refusing to publish, keeping last good file');
   }
 
-  log('candidate release:');
-  let candidateVersion = null;
-  let candidateComplete = false;
   const candidateIds = new Set();
-  const all = [...annual.events];
-
-  try {
-    const found = await discoverCandidate(fetchPage, buildCandidateVersions(now), log);
-    if (found) {
-      const pages = Math.max(1, Number(found.first?.TotalPages) || 1);
-      const merged = await fetchPages(
-        fetchPage, found.version, found.first, pages, CANDIDATE_MAX_PAGES);
-      candidateComplete = merged.complete && !merged.truncated;
-      // Never claim a bare version for a partial fetch.
-      candidateVersion = candidateComplete ? found.version : `${found.version}+partial`;
-      if (merged.failedPages) log(`  ${merged.failedPages} candidate page(s) failed`);
-      if (merged.truncated) log(`  candidate exceeds ${CANDIDATE_MAX_PAGES}-page cap — overflow dropped`);
-      for (const event of merged.events) {
-        if (event?.id != null) candidateIds.add(String(event.id));
-      }
-      all.push(...merged.events);
-      log(`  candidate v${candidateVersion}: +${merged.events.length} events`);
-    }
-  } catch (err) {
-    // Never fatal. The candidate improves recency; the annual base is the data.
-    log(`  candidate merge skipped: ${err.message}`);
+  for (const event of candidate) {
+    if (event?.id != null && event.id !== '') candidateIds.add(String(event.id));
   }
 
   // Dedupe by id. Candidates are appended after the annual base, so a
   // candidate's revision of an event present in both wins — it is the fresher
   // coding of the same incident.
   const byId = new Map();
-  for (const event of all) {
+  for (const event of [...annual, ...candidate]) {
     const id = event?.id != null ? String(event.id) : '';
     byId.set(id || Symbol('anon'), event);
   }
 
-  // Anchor the window to the dataset's own newest event. Taken as the global max
-  // rather than World Monitor's first-successful-page max: same value in
-  // practice (pages are walked newest-first) but it survives the newest page
-  // failing, which would otherwise shift the whole window backwards.
+  // Anchor the window to the dataset's own newest event, never to `now`. See
+  // TRAILING_WINDOW_MS: measuring from today would discard the entire annual
+  // base, which is ~7 months stale by design.
   const deduped = [...byId.values()];
   const latestMs = maxDateMs(deduped);
   const cutoff = latestMs - TRAILING_WINDOW_MS;
@@ -408,7 +361,7 @@ export async function buildMirror({ token, now = new Date(), log = () => {}, fet
     if (!Number.isFinite(ms)) return false;   // undated rows cannot be placed
     return ms >= cutoff;
   });
-  log(`dedupe ${all.length} -> ${deduped.length}, `
+  log(`dedupe ${annual.length + candidate.length} -> ${deduped.length}, `
     + `1-year window from ${isoDay(latestMs)} -> ${windowed.length}`);
 
   const slimmed = windowed.map(slim)
@@ -429,12 +382,15 @@ export async function buildMirror({ token, now = new Date(), log = () => {}, fet
 
   return {
     // Bumped only on a breaking shape change, so the app can refuse a payload
-    // it cannot read instead of decoding it into nonsense.
+    // it cannot read instead of decoding it into nonsense. The move from the
+    // API to the CSV downloads did NOT change the shape — `slim()` emits UCDP's
+    // own column names either way — so this stays at 1 and shipped builds keep
+    // reading the file.
     schema: 1,
     generatedAt: new Date(now.getTime()).toISOString(),
-    annualVersion: version,
-    candidateVersion,
-    candidateComplete,
+    annualVersion: ANNUAL_VERSION,
+    candidateVersion: candidate.length ? CANDIDATE_VERSION : null,
+    candidateComplete: candidate.length > 0,
     // The freshness signal that matters. A silently dead candidate merge is
     // otherwise invisible: the file keeps regenerating on schedule and stays
     // full while the content quietly falls back to the annual ~7-month lag.
@@ -443,7 +399,9 @@ export async function buildMirror({ token, now = new Date(), log = () => {}, fet
     eventCount: capped.length,
     candidateEventCount: capped.filter((event) => candidateIds.has(event.id)).length,
     attribution: 'Uppsala Conflict Data Program (UCDP) Georeferenced Event Dataset, '
-      + 'Department of Peace and Conflict Research, Uppsala University. CC BY 4.0.',
+      + 'Department of Peace and Conflict Research, Uppsala University. CC BY 4.0. '
+      + 'Davies, Pettersson, Öberg (2026) Journal of Peace Research; '
+      + 'Sundberg & Melander (2013) Journal of Peace Research 50(4).',
     events: capped,
   };
 }
@@ -455,12 +413,11 @@ async function main() {
     process.exit(2);
   }
 
-  const token = (process.env.UCDP_ACCESS_TOKEN || '').trim();
   console.log('=== UCDP mirror ===');
-  console.log(`  token: ${token ? `${token.slice(0, 4)}***${token.slice(-4)}` : '(none)'}`);
+  console.log('  source: ucdp.uu.se static downloads (no credential)');
   console.log(`  out:   ${args.out}`);
 
-  const payload = await buildMirror({ token, log: (line) => console.log(line) });
+  const payload = await buildMirror({ log: (line) => console.log(line) });
 
   console.log(`\n  annual ${payload.annualVersion}`
     + ` | candidate ${payload.candidateVersion ?? '(none)'}`
