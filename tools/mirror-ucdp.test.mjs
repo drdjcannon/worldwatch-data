@@ -78,6 +78,21 @@ test('a truncated row is dropped rather than mis-keyed', () => {
   assert.deepEqual(rows.map((r) => r.id), ['1']);
 });
 
+test('only the requested columns are kept', () => {
+  // Memory, not tidiness: the annual CSV is ~420k rows x 48 columns, and
+  // materialising all of it can OOM a runner.
+  const rows = parseCsv('id,best,geom_wkt\n1,5,POINT(1 2)\n', new Set(['id', 'best']));
+  assert.deepEqual(rows, [{ id: '1', best: '5' }]);
+});
+
+test('a header sharing none of the wanted columns is a loud failure', () => {
+  // An upstream schema change would otherwise publish 0 events silently.
+  assert.throws(
+    () => parseCsv('foo,bar\n1,2\n', new Set(['id', 'best'])),
+    /none of the expected columns/,
+  );
+});
+
 // ---- Cap ----
 
 test('cap reserves slots for the annual base', () => {

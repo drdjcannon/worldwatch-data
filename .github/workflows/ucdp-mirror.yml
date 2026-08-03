@@ -50,7 +50,24 @@ jobs:
         run: node --test tools/mirror-ucdp.test.mjs
 
       - name: Build the mirror
-        run: node tools/mirror-ucdp.mjs --out "${OUT_PATH}"
+        # Output is teed to a file so a failure can be published. The Actions log
+        # itself is not reachable from the agent's sandbox (the log host is not
+        # domain-allowlisted), so without this a CI-only failure is undiagnosable
+        # from here. Cheap enough to keep permanently.
+        run: |
+          set -o pipefail
+          node tools/mirror-ucdp.mjs --out "${OUT_PATH}" 2>&1 | tee /tmp/mirror.log
+
+      - name: Publish the log if the build failed
+        if: failure()
+        run: |
+          git config user.name  'worldwatch-bot'
+          git config user.email 'worldwatch-bot@users.noreply.github.com'
+          mkdir -p ucdp
+          tail -c 8000 /tmp/mirror.log > ucdp/last-error.log
+          git add ucdp/last-error.log
+          git commit -m 'Mirror failed: publish the log for diagnosis'
+          git push
 
       # `git status --porcelain` covers both a modified file and a brand-new one,
       # which the script's own byte-identical check cannot (there is nothing to

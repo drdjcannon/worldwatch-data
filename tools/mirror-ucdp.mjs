@@ -156,18 +156,62 @@ function unzipFirstCsv(buffer, log) {
 }
 
 /**
- * Parse RFC 4180 CSV into row objects keyed by header.
+ * The only columns the app reads. Everything else in the CSV is discarded as it
+ * is parsed rather than afterwards.
  *
- * Hand-rolled because the repo has no dependencies, and a naive `split(',')`
- * is not an option here: UCDP's `source_article` field contains commas,
- * embedded quotes and newlines in almost every row. Handles quoted fields,
- * doubled quotes as an escape, and CRLF.
+ * This is a memory decision, not tidiness. The annual GED CSV is ~420k rows x 48
+ * columns; materialising all of it costs roughly 20 million strings, which is
+ * enough to put a GitHub runner into GC thrash or an out-of-memory kill. Keeping
+ * 15 of 48 columns cuts that by two thirds, and the rows are projected one at a
+ * time so the full table never exists at once.
  */
-export function parseCsv(text) {
+const WANTED_COLUMNS = new Set([
+  'id', 'date_start', 'date_end', 'latitude', 'longitude', 'country', 'region',
+  'best', 'low', 'high', 'type_of_violence', 'side_a', 'side_b',
+  'where_coordinates', 'source_article',
+]);
+
+/**
+ * Parse RFC 4180 CSV, yielding one projected object per record.
+ *
+ * Hand-rolled because this repo has no dependencies — that is what lets the
+ * workflow run `node --test` with nothing installed. A `split(',')` is not an
+ * option: UCDP's `source_article` carries commas, doubled quotes and embedded
+ * newlines in almost every row, so a line-based reader mangles most of the file.
+ *
+ * Exported for the tests, which cover exactly those three cases.
+ *
+ * @param columns which headers to keep. Defaults to all of them, which is what
+ *   the tests use; production passes `WANTED_COLUMNS`.
+ */
+export function parseCsv(text, columns = null) {
   const rows = [];
-  let field = '';
+  let header = null;
   let record = [];
+  let field = '';
   let quoted = false;
+
+  /** Finish the current record: capture the header, or project and store a row. */
+  const endRecord = () => {
+    record.push(field);
+    field = '';
+    if (!header) {
+      header = record;
+      record = [];
+      return;
+    }
+    // A row whose width disagrees with the header is a file truncated mid-write.
+    // Dropping it is right; keeping it would shift every column.
+    if (record.length === header.length) {
+      const out = {};
+      for (let i = 0; i < header.length; i++) {
+        const key = header[i];
+        if (!columns || columns.has(key)) out[key] = record[i];
+      }
+      rows.push(out);
+    }
+    record = [];
+  };
 
   for (let i = 0; i < text.length; i++) {
     const char = text[i];
@@ -181,22 +225,28 @@ export function parseCsv(text) {
     if (char === '"') { quoted = true; continue; }
     if (char === ',') { record.push(field); field = ''; continue; }
     if (char === '\r') continue;
-    if (char === '\n') { record.push(field); rows.push(record); field = ''; record = []; continue; }
+    if (char === '\n') { endRecord(); continue; }
     field += char;
   }
   // A file not ending in a newline still has a final record.
-  if (field !== '' || record.length) { record.push(field); rows.push(record); }
+  if (field !== '' || record.length) endRecord();
 
-  const header = rows.shift();
   if (!header) return [];
-  return rows
-    // Trailing blank line, and any row the file truncated mid-write.
-    .filter((cells) => cells.length === header.length)
-    .map((cells) => {
-      const out = {};
-      for (let i = 0; i < header.length; i++) out[header[i]] = cells[i];
-      return out;
-    });
+  // A header that decoded but matched none of the wanted columns means the
+  // upstream schema changed under us. Say so, rather than publishing 0 events.
+  if (columns) {
+    const found = header.filter((key) => columns.has(key));
+    if (found.length === 0) {
+      throw new Error(
+        `none of the expected columns are present; header was: ${header.slice(0, 12).join(',')}`);
+    }
+  }
+  return rows;
+}
+
+/** Strip a UTF-8 BOM, which would otherwise make the first header key unusable. */
+function stripBom(text) {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
 /**
@@ -210,15 +260,17 @@ async function fetchReleases(log) {
   log(`annual ${ANNUAL_VERSION}:`);
   const zip = await download(ANNUAL_URL, `annual ${ANNUAL_VERSION}`);
   log(`  downloaded ${(zip.length / 1_048_576).toFixed(1)} MB`);
-  const annual = parseCsv(unzipFirstCsv(zip, log));
+  const annual = parseCsv(stripBom(unzipFirstCsv(zip, log)), WANTED_COLUMNS);
   log(`  parsed ${annual.length} rows`);
+  if (annual.length) log(`  newest annual date_start seen: ${maxIsoDay(annual)}`);
 
   log(`candidate ${CANDIDATE_VERSION}:`);
   let candidate = [];
   try {
     const csv = await download(CANDIDATE_URL, `candidate ${CANDIDATE_VERSION}`);
-    candidate = parseCsv(csv.toString('utf8'));
+    candidate = parseCsv(stripBom(csv.toString('utf8')), WANTED_COLUMNS);
     log(`  parsed ${candidate.length} rows`);
+    if (candidate.length) log(`  newest candidate date_start seen: ${maxIsoDay(candidate)}`);
   } catch (err) {
     log(`  skipped: ${err.message}`);
   }
@@ -240,6 +292,11 @@ function maxDateMs(events) {
     if (!Number.isFinite(max) || ms > max) max = ms;
   }
   return max;
+}
+
+/** Newest `date_start` in a batch of raw rows, as a day string, for logging. */
+function maxIsoDay(rows) {
+  return isoDay(maxDateMs(rows)) ?? 'unparseable';
 }
 
 function isoDay(ms) {
