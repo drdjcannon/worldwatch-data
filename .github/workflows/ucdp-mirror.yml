@@ -60,6 +60,10 @@ jobs:
 
       - name: Publish the log if the build failed
         if: failure()
+        # The Actions log host is not reachable from the sandbox this repo is
+        # maintained from, so a CI-only failure is otherwise undiagnosable
+        # without a human relaying it. Committing the tail costs nothing on a
+        # green run and saves a round trip on a red one.
         run: |
           git config user.name  'worldwatch-bot'
           git config user.email 'worldwatch-bot@users.noreply.github.com'

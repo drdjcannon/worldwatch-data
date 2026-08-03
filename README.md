@@ -78,6 +78,12 @@ https://cdn.jsdelivr.net/gh/drdjcannon/worldwatch-data@main/ucdp/ucdp-events.jso
 `raw.githubusercontent.com` also works and the app falls back to it, but it is
 not a CDN and GitHub's terms discourage using it as one.
 
+## Status
+
+Live since 2026-08-03. The published file carries 2,000 events; the last run
+reported `newestEventAt` 2026-06-30, a 34-day content lag, which means the
+candidate merge is working (annual-only would be ~7 months).
+
 ## Operating
 
 **No secrets required.** The workflow commits with the built-in `GITHUB_TOKEN`,
@@ -85,6 +91,9 @@ and the UCDP downloads need no credential, so there is nothing to configure.
 
 Run it by hand from the Actions tab → *Mirror UCDP conflict data* → Run workflow.
 A run whose output is byte-identical to the published file makes no commit.
+
+If a run fails, it commits the tail of its own output to `ucdp/last-error.log`.
+Read that first.
 
 **When a new UCDP release lands**, bump `ANNUAL_URL` / `ANNUAL_VERSION` and
 `CANDIDATE_URL` / `CANDIDATE_VERSION` at the top of
