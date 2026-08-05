@@ -13,7 +13,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { capWithAnnualFloor, buildMirror, parseCsv } from './mirror-ucdp.mjs';
+import { capWithAnnualFloor, buildMirror, parseCsv, countryTotals } from './mirror-ucdp.mjs';
 
 const DAY = 86_400_000;
 
@@ -226,6 +226,43 @@ test('refuses to publish a candidate-only payload over good annual data', async 
     }),
     /annual release is empty/,
   );
+});
+
+// ---- Country totals ----
+
+test('totals are computed over the whole record, not the capped slice', async () => {
+  // The bug this exists for: Ukraine arrived with 446 of its events in a
+  // 2,000-event payload, summed to 953 deaths, and that was shown as the
+  // country's recorded toll and fed the war/minor thresholds.
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const annual = Array.from({ length: 2500 }, (_u, i) =>
+    row(`a${i}`, day(anchor, 10), { country: 'Ukraine', best: 10, low: 8, high: 12 }));
+
+  const out = await buildMirror({ now: new Date(anchor), fetch: fakeReleases(annual, []) });
+
+  assert.equal(out.eventCount, 2000, 'the event list is still capped');
+  const ukraine = out.countryTotals.find((c) => c.country === 'Ukraine');
+  assert.equal(ukraine.events, 2500, 'totals must count every row, not the 2000 kept');
+  assert.equal(ukraine.deaths, 25_000, 'and sum every death, not the capped slice');
+  assert.equal(ukraine.deathsLow, 20_000);
+  assert.equal(ukraine.deathsHigh, 30_000);
+});
+
+test('totals are keyed by UCDP spelling and sorted deadliest first', () => {
+  const totals = countryTotals([
+    { country: 'Mexico', best: '5', low: '5', high: '5' },
+    { country: 'Russia (Soviet Union)', best: '900', low: '800', high: '1000' },
+    { country: 'Russia (Soviet Union)', best: '100', low: '90', high: '110' },
+  ]);
+
+  assert.deepEqual(totals.map((c) => c.country), ['Russia (Soviet Union)', 'Mexico']);
+  assert.equal(totals[0].deaths, 1000, 'CSV strings must be coerced, not concatenated');
+  assert.equal(totals[0].events, 2);
+});
+
+test('rows with no country are skipped rather than bucketed under empty', () => {
+  const totals = countryTotals([{ country: '', best: '5' }, { best: '3' }]);
+  assert.deepEqual(totals, []);
 });
 
 // ---- The app's contract ----

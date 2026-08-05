@@ -368,6 +368,41 @@ function parseArgs(argv) {
 }
 
 /**
+ * Per-country totals over the FULL windowed record, before the event cap.
+ *
+ * **This is why the app's death tolls were wrong.** The event list is capped at
+ * 2,000 rows to keep the download small, and a year of global GED is tens of
+ * thousands — so Ukraine arrived with 446 of its events and the app summed those
+ * to 953 deaths and displayed it as the country's recorded toll. It is a real
+ * sum of a truncated sample, which is a worse kind of wrong than an obvious gap.
+ *
+ * Aggregating here costs about 15 kB for ~120 countries and is computed over
+ * every row inside the one-year window, so the figure is the whole record's
+ * rather than the shipped slice's.
+ *
+ * Keyed by UCDP's own country spelling. The app maps those to its geometry (UCDP
+ * writes "Russia (Soviet Union)" and "DR Congo (Zaire)"), which it already has
+ * to do for the event rows.
+ */
+export function countryTotals(rows) {
+  const byCountry = new Map();
+  for (const row of rows) {
+    const country = row.country || '';
+    if (!country) continue;
+    const entry = byCountry.get(country)
+      ?? { country, events: 0, deaths: 0, deathsLow: 0, deathsHigh: 0 };
+    entry.events += 1;
+    entry.deaths += Number(row.best) || 0;
+    entry.deathsLow += Number(row.low) || 0;
+    entry.deathsHigh += Number(row.high) || 0;
+    byCountry.set(country, entry);
+  }
+  // Deadliest first: a truncation here would drop the countries that matter, and
+  // the app reads the whole map anyway.
+  return [...byCountry.values()].sort((a, b) => b.deaths - a.deaths);
+}
+
+/**
  * Build the mirror payload from the two published CSV releases.
  *
  * @param fetch injectable transport returning `{annual, candidate}` arrays of
@@ -421,6 +456,12 @@ export async function buildMirror({ now = new Date(), log = () => {}, fetch } = 
   log(`dedupe ${annual.length + candidate.length} -> ${deduped.length}, `
     + `1-year window from ${isoDay(latestMs)} -> ${windowed.length}`);
 
+  // Before the cap, deliberately: these totals describe the record, not the
+  // slice that fits in the payload.
+  const totals = countryTotals(windowed);
+  log(`country totals: ${totals.length} countries, `
+    + `${totals.reduce((sum, c) => sum + c.deaths, 0).toLocaleString('en-US')} deaths`);
+
   const slimmed = windowed.map(slim)
     .sort((a, b) => parseMs(b.date_start) - parseMs(a.date_start));
   const capped = capWithAnnualFloor(
@@ -455,6 +496,10 @@ export async function buildMirror({ now = new Date(), log = () => {}, fetch } = 
     oldestEventAt: isoDay(oldestMs),
     eventCount: capped.length,
     candidateEventCount: capped.filter((event) => candidateIds.has(event.id)).length,
+    // Totals over the whole windowed record. `events` below is a capped slice of
+    // it, so summing that gives a real total of the wrong population — which is
+    // exactly the bug these exist to fix.
+    countryTotals: totals,
     attribution: 'Uppsala Conflict Data Program (UCDP) Georeferenced Event Dataset, '
       + 'Department of Peace and Conflict Research, Uppsala University. CC BY 4.0. '
       + 'Davies, Pettersson, Öberg (2026) Journal of Peace Research; '
