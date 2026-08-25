@@ -1,0 +1,127 @@
+# Mirrors gpsjam.org's daily GPS interference grid for the WorldWatch iOS app.
+#
+# WHY THIS EXISTS, AND IT IS NOT THE CREDENTIAL
+#
+# gpsjam.org has no key and no quota, so the app could fetch it directly. What it cannot do is turn
+# an H3 cell id into a polygon: that needs the H3 library, an icosahedral gnomonic projection of a
+# few thousand lines, for one map layer. This job does the conversion so the phone reads plain
+# coordinates. That is the whole trade.
+#
+# ATTRIBUTION. UCDP states CC BY 4.0 and grants redistribution outright; gpsjam.org states no licence
+# for reuse of its files. The daily schedule was enabled on the operator's decision, on the precedent
+# that World Monitor has consumed the same files daily since July, and the app names gpsjam.org and
+# ADS-B Exchange in the layer's own explanation - which is more than upstream does, where the name
+# appears only in code comments. If gpsjam.org ever asks for this to stop, deleting the schedule is
+# the whole of it: the app degrades to "no grid published yet", a state it already handles.
+#
+# One dependency, and it is the reason the job exists: `h3-js`. Installed in its own step and
+# pinned, because an unpinned major could change the boundary order and put every cell somewhere
+# plausible and wrong. The test step needs none of it - the mirror injects H3 so the shaping is
+# verifiable with nothing installed - so a failure in `Test` is about logic and a failure in `Build`
+# is about the network or the library.
+
+name: Mirror GPS interference
+
+on:
+  # Daily, an hour after the grid usually lands. gpsjam publishes once a day, and a run whose output
+  # is byte-identical writes nothing and makes no commit.
+  #
+  # Enabled 2026-08-24 on the operator's decision: World Monitor has consumed gpsjam.org daily since
+  # July, and the app credits gpsjam.org and ADS-B Exchange in the layer's own text - which is more
+  # than upstream does, where the name appears only in code comments.
+  schedule:
+    - cron: '20 7 * * *'
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Grid date (YYYY-MM-DD). Blank means the newest in the manifest.'
+        required: false
+      max-hexes:
+        description: 'Cap on published cells, worst first. Default 1500.'
+        required: false
+
+# Two concurrent runs would race on the commit. Never cancel in progress: a half-finished run
+# leaves the published file untouched, which is safe.
+concurrency:
+  group: gpsjam-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      OUT_PATH: gpsjam/gps-interference.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Runs with nothing installed, which is what makes it a real test rather than a formality:
+      # every filter, band, sort and cap is covered against a fake H3.
+      - name: Test the mirror logic
+        run: node --test tools/mirror-gpsjam.test.mjs
+
+      - name: Install h3-js
+        # Pinned. A major bump could change `cellToBoundary`'s vertex order or its lat/lng
+        # convention, and either would publish cells that decode cleanly and sit in the wrong place.
+        run: npm install --no-save --no-audit --no-fund h3-js@4.1.0
+
+      - name: Build the mirror
+        # Teed to a file so a failure can be published: the Actions log host is not reachable from
+        # the sandbox this repo is maintained from, so without this a CI-only failure needs a human
+        # to relay it.
+        run: |
+          set -o pipefail
+          ARGS=(--out "${OUT_PATH}")
+          if [ -n "${{ inputs.date }}" ]; then ARGS+=(--date "${{ inputs.date }}"); fi
+          if [ -n "${{ inputs.max-hexes }}" ]; then ARGS+=(--max-hexes "${{ inputs.max-hexes }}"); fi
+          node tools/mirror-gpsjam.mjs "${ARGS[@]}" 2>&1 | tee /tmp/gpsjam.log
+
+      - name: Publish the log if the build failed
+        if: failure()
+        run: |
+          git config user.name  'worldwatch-bot'
+          git config user.email 'worldwatch-bot@users.noreply.github.com'
+          mkdir -p gpsjam
+          tail -c 8000 /tmp/gpsjam.log > gpsjam/last-error.log
+          git add gpsjam/last-error.log
+          git commit -m 'GPS interference mirror failed: publish the log for diagnosis'
+          git push
+
+      # `git status --porcelain` covers both a modified file and a brand-new one, which the
+      # script's own byte-identical check cannot: there is nothing to compare against on run one.
+      - name: Publish if changed
+        run: |
+          git config user.name  'worldwatch-bot'
+          git config user.email 'worldwatch-bot@users.noreply.github.com'
+          if [ -z "$(git status --porcelain -- "${OUT_PATH}")" ]; then
+            echo 'No change in the interference grid - nothing to publish.'
+            exit 0
+          fi
+          DATE=$(node -e "process.stdout.write(require('./${OUT_PATH}').date)")
+          COUNT=$(node -e "process.stdout.write(String(require('./${OUT_PATH}').hexCount))")
+          git add "${OUT_PATH}"
+          git commit -m "GPS interference: ${COUNT} cells for ${DATE}"
+          git push
+
+      - name: Summarise
+        if: always()
+        run: |
+          if [ -f "${OUT_PATH}" ]; then
+            node -e "
+              const d = require('./${OUT_PATH}');
+              const lag = Math.round((Date.now() - Date.parse(d.date)) / 86400000);
+              console.log('| field | value |');
+              console.log('|---|---|');
+              console.log('| grid date |', d.date, '(' + lag + ' days old) |');
+              console.log('| cells published |', d.hexCount, '(' + d.stats.highCount + ' high, ' + d.stats.mediumCount + ' medium) |');
+              console.log('| worst cell |', d.stats.worstPct + '% of aircraft |');
+              console.log('| dropped |', d.stats.droppedLowInterference, 'low,', d.stats.droppedLowSample, 'small sample,', d.stats.droppedOverCap, 'over cap |');
+              console.log('| unconvertible |', d.stats.conversionFailures, d.stats.conversionFailures > 0 ? '**check the H3 version**' : '', '|');
+            " >> "${GITHUB_STEP_SUMMARY}"
+          fi

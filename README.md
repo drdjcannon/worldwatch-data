@@ -67,6 +67,36 @@ about seven. A newest event ~30 days old means the candidate merge is working;
 ~210 days means it silently died and only the annual base is landing. The
 workflow warns above 90 days and reports it in the run summary.
 
+
+## `gpsjam/gps-interference.json`
+
+Daily GPS/GNSS interference by H3 cell, from [gpsjam.org](https://gpsjam.org), refreshed by
+[`.github/workflows/gpsjam-mirror.yml`](.github/workflows/gpsjam-mirror.yml).
+
+**Why a mirror exists, and it is not the credential.** gpsjam.org has no key and no quota, so the
+app could fetch it directly. What it cannot do is turn an H3 resolution-4 cell id into a polygon:
+that needs the H3 library, an icosahedral gnomonic projection of a few thousand lines of C, for one
+map layer. This job runs `h3-js` once a day so the phone reads plain coordinates. That is the whole
+argument for it.
+
+**What it publishes.** One row per cell above the low band, worst first, capped at 1,500: the cell
+id, its interference percentage, the band, the aircraft counts behind it, a centre and a ring. Plus
+a `stats` block stating what was dropped and why - low interference, fewer than three aircraft, over
+the cap, unconvertible - because a day when the mirror thins 90% of its input otherwise looks
+identical to a quiet day.
+
+**The metric is gpsjam.org's own**: the share of aircraft over a cell reporting bad GPS accuracy,
+banded low under 2%, medium 2 to 10%, high above 10%. Those thresholds are transcribed from World
+Monitor's parser rather than re-derived, so both apps mean the same thing by "high".
+
+**Attribution.** gpsjam.org is one person's site publishing an aggregate derived from ADS-B
+Exchange, and unlike UCDP it states no licence for reuse of its files. The schedule was enabled on
+2026-08-24 on the operator's decision, on the precedent that World Monitor has consumed the same
+files daily since July. The app names **gpsjam.org and ADS-B Exchange** in the layer's own
+explanation, which is more than upstream does - there the name appears only in code comments. If
+gpsjam.org ever asks for this to stop, deleting the cron here is the whole of it: the app degrades to
+"no grid published yet", which is a state it already handles.
+
 ## Consuming it
 
 Prefer jsDelivr, which is built to serve GitHub content at scale:
