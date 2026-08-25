@@ -30,6 +30,9 @@
 //   100% cell, and a map of those is a map of small samples.
 // - **Low-interference cells.** Every populated cell has some bad reports, so keeping them makes a
 //   quarter of a million polygons that say "aviation is normal". Medium and high are the signal.
+// - **Everything past the cap**, ordered by the *lower bound* of the interference rate rather than
+//   by the rate itself. The first real run showed why: ranked by percentage, the file led with
+//   three-of-four-aircraft cells at 75% and dropped better-evidenced ones. See `wilsonLowerBound`.
 // Both counts are published rather than silently applied: a day when the mirror thins 90% of its
 // input looks identical to a quiet day unless the numbers travel with the file. That is this
 // project's own "an empty feed must say why" rule applied to a mirror.
@@ -125,6 +128,31 @@ function latestDate(manifestCsv) {
   return date;
 }
 
+/**
+ * The lower bound of the 95% Wilson score interval for bad/total.
+ *
+ * **This is what the cap is ranked on, and ranking on the raw percentage was wrong.** The first real
+ * run published 1,500 of 1,713 candidate cells ordered by percentage, and the top of that list was
+ * three-bad-of-four-aircraft cells at 75% while better-evidenced cells - a large share of a hundred
+ * aircraft - fell off the end. That is the same defect as scoring recovered text by
+ * characters-times-confidence: a metric that rewards a tiny sample buries the finding it was built
+ * to surface.
+ *
+ * Wilson is the standard answer for ranking a rate over small samples: it asks "what is the lowest
+ * rate consistent with this evidence", so 3 of 4 (a wide interval) scores about 30% while 45 of 100
+ * scores about 36% and outranks it. The **published** figure stays the raw percentage, because that
+ * is gpsjam.org's own metric and both apps must agree on it - only the selection changes.
+ */
+function wilsonLowerBound(bad, total) {
+  if (total <= 0) return 0;
+  const z = 1.96;
+  const p = bad / total;
+  const denominator = 1 + (z * z) / total;
+  const centre = p + (z * z) / (2 * total);
+  const margin = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total));
+  return Math.max(0, (centre - margin) / denominator);
+}
+
 function band(pct) {
   if (pct > HIGH_THRESHOLD) return 'high';
   if (pct >= MEDIUM_THRESHOLD) return 'medium';
@@ -201,6 +229,8 @@ function processHexes(csv, { minAircraft, maxHexes, h3 }) {
       totalAircraft: total,
       center,
       ring,
+      // Not published: it exists to order the cap, and the app has no use for it. Stripped below.
+      _confidence: wilsonLowerBound(bad, total),
     });
   }
 
@@ -211,12 +241,12 @@ function processHexes(csv, { minAircraft, maxHexes, h3 }) {
       + `${conversionAttempts}) - upstream changed format, aborting rather than publishing`);
   }
 
-  // High before medium, then worst percentage first, so the cap keeps the cells worth drawing.
-  hexes.sort((a, b) => {
-    if (a.level !== b.level) return a.level === 'high' ? -1 : 1;
-    return b.pct - a.pct;
-  });
-  const capped = hexes.slice(0, maxHexes);
+  // Best-evidenced first, **not** highest percentage and not band-first. The cap is a budget, so it
+  // should keep the cells a reader can rely on: a well-sampled 9% cell says more about real
+  // interference than a three-aircraft 75% one, and band-first ordering would have kept every tiny
+  // "high" ahead of every solid "medium". See `wilsonLowerBound`.
+  hexes.sort((a, b) => b._confidence - a._confidence);
+  const capped = hexes.slice(0, maxHexes).map(({ _confidence, ...rest }) => rest);
 
   return {
     hexes: capped,
@@ -227,7 +257,12 @@ function processHexes(csv, { minAircraft, maxHexes, h3 }) {
       // Named so the app can say "1,500 of 2,310 shown" rather than implying the file is complete.
       droppedOverCap: hexes.length - capped.length,
       conversionFailures,
-      worstPct: capped.length ? capped[0].pct : 0,
+      // The worst *published* percentage, which after the Wilson ordering is no longer the first
+      // row - so it is computed rather than read off the top of the list, where it silently became
+      // "the best-evidenced cell's percentage" instead.
+      worstPct: capped.reduce((worst, hex) => Math.max(worst, hex.pct), 0),
+      // Named so a reader of the file knows which of the two numbers the cap was applied to.
+      orderedBy: 'wilson95Lower',
       highCount: capped.filter((hex) => hex.level === 'high').length,
       mediumCount: capped.filter((hex) => hex.level === 'medium').length,
     },

@@ -118,7 +118,28 @@ test('a day with nothing above the low band publishes empty rather than aborting
   assert.equal(stats.worstPct, 0);
 });
 
-test('high comes before medium, worst first, and the cap says what it dropped', () => {
+test('the cap keeps the best-evidenced cells, not the smallest samples', () => {
+  // The defect the first real run exposed: ordered by percentage, the published file led with
+  // three-bad-of-four-aircraft cells at 75% while a large share of a hundred aircraft fell off the
+  // end. Wilson's lower bound reverses that, and the *published* percentage is untouched.
+  const csv = `${HEADER}\n`
+    + '841020,1,3\n'      // 75% of 4 aircraft - loud and thin
+    + '842030,55,45\n';   // 45% of 100 aircraft - quieter and solid
+  const { hexes } = processHexes(csv, { minAircraft: 3, maxHexes: 1, h3: fakeH3 });
+  assert.equal(hexes.length, 1);
+  assert.equal(hexes[0].totalAircraft, 100, 'the cap kept the four-aircraft cell');
+  assert.equal(hexes[0].pct, 45, 'the published figure is still the raw percentage');
+  // And nothing internal leaks into the file.
+  assert.equal(hexes[0]._confidence, undefined);
+
+  // The worst percentage in the stats is still the worst *published* one, which is no longer the
+  // first row now that ordering is by confidence.
+  const both = processHexes(csv, { minAircraft: 3, maxHexes: 10, h3: fakeH3 });
+  assert.equal(both.stats.worstPct, 75);
+  assert.equal(both.stats.orderedBy, 'wilson95Lower');
+});
+
+test('bands and counts survive the reordering', () => {
   const csv = `${HEADER}\n`
     + '841020,70,30\n'   // 30%, high
     + '842030,95,5\n'    // 5%, medium
