@@ -435,6 +435,18 @@ async function probe(log, now) {
     for (const name of names) log(`  ${name}`);
     const dirs = [...new Set(page.match(/[A-Za-z0-9_/-]*candidate[A-Za-z0-9_/-]*/gi) ?? [])];
     log(`candidate paths mentioned: ${dirs.join(', ') || '(none)'}`);
+
+    // Every downloadable the page links to, so a dataset we do not yet mirror
+    // can be found without another round trip. UCDP/PRIO's Armed Conflict
+    // Dataset is the one on the list: it carries UCDP's OWN war/minor
+    // classification per conflict-year, which `ConflictClassifier` currently
+    // approximates with thresholds transcribed out of World Monitor.
+    const files = [...new Set(
+      (page.match(/https?:\/\/[^"'\s<>]+\.(?:csv|zip|xlsx)/gi) ?? [])
+        .map((url) => url.replace(/&amp;/g, '&')),
+    )].sort();
+    log(`\nall ${files.length} downloadable files linked from the page:`);
+    for (const file of files) log(`  ${file}`);
   }
 
   // Whatever the generator would try today, so a future rename shows up as a
