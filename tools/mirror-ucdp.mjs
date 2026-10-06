@@ -39,14 +39,13 @@
 // the dataset-anchored window, the annual floor, and the slimming. Each was
 // learned the hard way over there and the comments say which.
 //
-// Dropped with the API: token handling, page walking, and version probing. The
-// download URLs carry their version in the path, so a new release is a one-line
-// edit rather than a speculative probe — and a 404 is then a loud failure
-// instead of a silent fallback to last year's data.
+// Dropped with the API: token handling and page walking. Version probing came
+// BACK on 2026-10-06, and why is worth reading — see CANDIDATE_FLOOR.
 //
 // Usage:
 //   node mirror-ucdp.mjs --out ucdp-events.json
 //   node mirror-ucdp.mjs --out /tmp/x.json --dry-run
+//   node mirror-ucdp.mjs --out x.json --allow-stale   # publish past the lag ceiling
 
 import { writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -63,19 +62,68 @@ import { execFileSync } from 'node:child_process';
  * lag globally" for it, against the annual's ~7 months — and is an ADDITION on
  * top, never a replacement.
  *
- * Versions live in the URL rather than being probed. With the API a wrong guess
- * fell back to an older release and published stale data quietly; here a bump
- * UCDP has made and we have not is a 404, which fails the run loudly. Check
- * ucdp.uu.se/downloads when that happens.
- *
- * The cumulative Jan-Jun candidate is used rather than the single-month file:
- * one request then covers the whole year to date.
+ * The cumulative year-to-date candidate is used rather than a single-month
+ * file: one request then covers the whole year so far.
  */
 const ANNUAL_URL = 'https://ucdp.uu.se/downloads/ged/ged261-csv.zip';
 const ANNUAL_VERSION = '26.1';
-const CANDIDATE_URL =
-  'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv';
-const CANDIDATE_VERSION = '26.01.26.06';
+
+const CANDIDATE_DIR = 'https://ucdp.uu.se/downloads/candidateged/';
+
+/**
+ * The annual release the candidate files extend, as it is spelled in their
+ * filenames: `GEDEvent_v26_01_<YY>_<MM>.csv`. Bump when ANNUAL_URL bumps.
+ */
+const CANDIDATE_LINEAGE = '26_01';
+
+/**
+ * The oldest candidate release we will accept, and the reason this file probes
+ * at all.
+ *
+ * **The hardcoded URL this replaced froze the mirror for 98 days.** It named
+ * `GEDEvent_v26_01_26_06.csv`, and the comment above it argued that a version
+ * UCDP had moved past would be "a 404, which fails the run loudly". It is not.
+ * The June file keeps serving perfectly, so the fetch succeeded, the payload
+ * came out byte-identical, the script wrote nothing, the workflow's
+ * `git status --porcelain` saw no change, and every weekly run went green while
+ * three monthly releases came and went. A stale pin does not 404; it just
+ * quietly keeps answering.
+ *
+ * So: generate every release from this floor to the current month, try them
+ * newest-first, and take the first that both resolves AND parses. The floor is
+ * the known-good file, so a failed probe degrades to exactly the old behaviour
+ * rather than to nothing — and if even the floor is gone, THAT is the loud
+ * failure the old comment wanted, because it means UCDP renamed the files.
+ *
+ * Note the probe is cheap in the only case that matters: a miss is a 404 with a
+ * few hundred bytes of body, and only the file we actually take is downloaded in
+ * full.
+ */
+const CANDIDATE_FLOOR = { year: 26, month: 6 };
+
+/**
+ * Hard ceiling on how old the newest published event may be, in days.
+ *
+ * A green scheduled job is not evidence of fresh data — that is the whole
+ * lesson of the 98-day freeze, where nothing in the system could report the
+ * problem because nothing checked the DATA's age. The run now refuses to
+ * publish past this and fails loudly, which commits the error log.
+ *
+ * **90 is calibrated against the freeze itself, and the first number I picked
+ * was wrong.** 120 looked safe on the two known states — a healthy merge peaks
+ * near 58 days (releases land on the 21st covering through the end of the
+ * previous month, plus up to a week of our weekly polling, plus slack for UCDP
+ * not publishing on a fixed day), and annual-only is ~210. But the live file
+ * had been frozen at **99** days for two months, so a 120-day ceiling would
+ * have sat silently through the exact failure it exists to catch, for another
+ * three weeks. A guard has to be tighter than the bug it is for.
+ *
+ * At 90 this freeze fails on the first Monday after 2026-09-28 instead of
+ * running green indefinitely. The cost is that a genuine two-release slip by
+ * UCDP turns the job red; that is the right trade, and `--allow-stale`
+ * publishes anyway when an operator has looked and decided.
+ */
+const MAX_CONTENT_LAG_DAYS = 90;
 
 /** The annual zip is ~50 MB, so this is generous on purpose. */
 const DOWNLOAD_TIMEOUT_MS = 180_000;
@@ -162,13 +210,20 @@ function unzipFirstCsv(buffer, log) {
  * This is a memory decision, not tidiness. The annual GED CSV is ~420k rows x 48
  * columns; materialising all of it costs roughly 20 million strings, which is
  * enough to put a GitHub runner into GC thrash or an out-of-memory kill. Keeping
- * 15 of 48 columns cuts that by two thirds, and the rows are projected one at a
+ * 18 of 48 columns cuts that by two thirds, and the rows are projected one at a
  * time so the full table never exists at once.
+ *
+ * `where_prec`, `date_prec` and `event_clarity` were added 2026-10-06, on
+ * UCDP's own instruction to consumers. They are the three codebook fields that
+ * say how much a row's coordinate and date may be trusted, and publishing them
+ * costs about 46 bytes an event — roughly 10% on a 894 kB payload — against the
+ * alternative of drawing province centroids as precise incident pins.
  */
 const WANTED_COLUMNS = new Set([
   'id', 'date_start', 'date_end', 'latitude', 'longitude', 'country', 'region',
   'best', 'low', 'high', 'type_of_violence', 'side_a', 'side_b',
   'where_coordinates', 'source_article',
+  'where_prec', 'date_prec', 'event_clarity',
 ]);
 
 /**
@@ -250,13 +305,92 @@ function stripBom(text) {
 }
 
 /**
+ * Every candidate release from the floor to `now`, NEWEST FIRST.
+ *
+ * Pure and exported so the generation is testable without network — which
+ * matters here more than usual, because ucdp.uu.se is unreachable from the
+ * machine this repo is maintained from, so CI is the only place the real URLs
+ * are ever exercised.
+ *
+ * The ceiling is the current calendar month rather than the previous one even
+ * though a release covers the month before it is published. Two reasons: the
+ * filename convention could name either the covered month or the publication
+ * month, and probing one extra month that does not exist costs a single 404.
+ * Guessing which convention it is, and guessing wrong, costs a month of data.
+ */
+export function candidateReleases(
+  now = new Date(), floor = CANDIDATE_FLOOR, lineage = CANDIDATE_LINEAGE,
+) {
+  const pad = (value) => String(value).padStart(2, '0');
+  const endYear = now.getUTCFullYear() % 100;
+  const endMonth = now.getUTCMonth() + 1;
+
+  const out = [];
+  let { year, month } = floor;
+  // Bounded rather than `while (true)`: a clock or a floor far enough wrong to
+  // spin forever should produce a short wrong list, not hang a CI job.
+  for (let guard = 0; guard < 120; guard++) {
+    const stem = `GEDEvent_v${lineage}_${pad(year)}_${pad(month)}`;
+    out.push({
+      version: `${lineage.replace('_', '.')}.${pad(year)}.${pad(month)}`,
+      url: `${CANDIDATE_DIR}${stem}.csv`,
+    });
+    // The floor is always included, even when `now` is before it.
+    if (year > endYear || (year === endYear && month >= endMonth)) break;
+    month += 1;
+    if (month > 12) { month = 1; year += 1; }
+  }
+  return out.reverse();
+}
+
+/**
+ * Take the newest candidate release that resolves.
+ *
+ * **A parse failure counts as a miss, not an error**, and that is deliberate: a
+ * WAF or a CDN answering 200 with an HTML notice is not a 404, and treating it
+ * as success would hand `parseCsv` a page of markup. Falling through to the
+ * next release turns "the server said something odd" into "that release is not
+ * there", which is the same decision from the reader's side.
+ *
+ * Throws when NOTHING resolves. By this point the annual zip has already
+ * downloaded, so the host is demonstrably up and every candidate URL missing
+ * means the naming convention moved — which no fallback can paper over and
+ * which must not be allowed to publish quietly.
+ */
+async function fetchCandidate(log, now) {
+  const attempts = candidateReleases(now);
+  log(`candidate: probing ${attempts.length} releases, newest first`);
+
+  for (const { version, url } of attempts) {
+    log(`  try ${url}`);
+    let rows;
+    try {
+      const body = await download(url, `candidate ${version}`);
+      rows = parseCsv(stripBom(body.toString('utf8')), WANTED_COLUMNS);
+    } catch (err) {
+      log(`    miss: ${String(err.message).slice(0, 140)}`);
+      continue;
+    }
+    if (rows.length === 0) {
+      log('    miss: resolved but parsed 0 rows');
+      continue;
+    }
+    log(`    TAKEN ${version}: ${rows.length} rows, newest date_start ${maxIsoDay(rows)}`);
+    return { version, rows };
+  }
+
+  throw new Error(
+    `no candidate release resolved. Tried ${attempts.map((a) => a.version).join(', ')} `
+    + `— including the ${attempts[attempts.length - 1].version} floor, which has served `
+    + 'since 2026-08. UCDP has most likely renamed the candidate files; check '
+    + 'ucdp.uu.se/downloads and update CANDIDATE_LINEAGE / CANDIDATE_FLOOR.');
+}
+
+/**
  * Fetch both releases. Injectable so the tests can run without network — the
  * agent shell cannot reach ucdp.uu.se at all.
- *
- * Returns `candidate: []` rather than throwing when the candidate is
- * unavailable: it improves recency, but the annual base IS the data.
  */
-async function fetchReleases(log) {
+async function fetchReleases(log, now) {
   log(`annual ${ANNUAL_VERSION}:`);
   const zip = await download(ANNUAL_URL, `annual ${ANNUAL_VERSION}`);
   log(`  downloaded ${(zip.length / 1_048_576).toFixed(1)} MB`);
@@ -264,17 +398,8 @@ async function fetchReleases(log) {
   log(`  parsed ${annual.length} rows`);
   if (annual.length) log(`  newest annual date_start seen: ${maxIsoDay(annual)}`);
 
-  log(`candidate ${CANDIDATE_VERSION}:`);
-  let candidate = [];
-  try {
-    const csv = await download(CANDIDATE_URL, `candidate ${CANDIDATE_VERSION}`);
-    candidate = parseCsv(stripBom(csv.toString('utf8')), WANTED_COLUMNS);
-    log(`  parsed ${candidate.length} rows`);
-    if (candidate.length) log(`  newest candidate date_start seen: ${maxIsoDay(candidate)}`);
-  } catch (err) {
-    log(`  skipped: ${err.message}`);
-  }
-  return { annual, candidate };
+  const candidate = await fetchCandidate(log, now);
+  return { annual, candidate: candidate.rows, candidateVersion: candidate.version };
 }
 
 // ---- Shaping ----
@@ -332,6 +457,25 @@ function slim(event) {
     side_b: String(event.side_b || '').slice(0, 200),
     where_coordinates: String(event.where_coordinates || '').slice(0, 200),
     source_article: String(event.source_article || '').slice(0, 300),
+    // UCDP's three precision codes, added 2026-10-06. ADDITIVE AT SCHEMA 1, and
+    // that is not a style choice: `UCDPFeed.supportedSchema` is 1 and the app
+    // THROWS on anything higher, so bumping the number would break UCDP on
+    // every shipped 1.0 and 1.1 install until they updated. Swift's Codable
+    // ignores keys it does not know, so an old build simply does not see these.
+    //
+    // `where_prec` 1-7: 3 and 4 place the event at an ADM2 or ADM1 CENTROID and
+    // 6 at the country's, so drawing them as precise pins puts violence in the
+    // geographic middle of provinces where nothing happened. `date_prec` 1-5:
+    // above 1 the event is placeable only to a week, month or year, and a daily
+    // time series that ignores it shows artificial spikes. `event_clarity` 1-2:
+    // 2 means the report aggregates several incidents.
+    //
+    // `num()` yields 0 when the column is absent, and 0 is not a valid code for
+    // any of the three — so 0 means "unknown" and the app must treat it exactly
+    // as it treats the field being missing altogether, which is as today.
+    where_prec: num(event.where_prec),
+    date_prec: num(event.date_prec),
+    event_clarity: num(event.event_clarity),
   };
 }
 
@@ -359,10 +503,11 @@ export function capWithAnnualFloor(sortedNewestFirst, isCandidate, maxEvents, fl
 // ---- Main ----
 
 function parseArgs(argv) {
-  const out = { out: null, dryRun: false };
+  const out = { out: null, dryRun: false, allowStale: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') out.out = argv[++i];
     else if (argv[i] === '--dry-run') out.dryRun = true;
+    else if (argv[i] === '--allow-stale') out.allowStale = true;
   }
   return out;
 }
@@ -405,14 +550,19 @@ export function countryTotals(rows) {
 /**
  * Build the mirror payload from the two published CSV releases.
  *
- * @param fetch injectable transport returning `{annual, candidate}` arrays of
- *   raw CSV row objects. Defaults to the real downloads. Injected by
- *   `mirror-ucdp.test.mjs`, which is the only way any of this is verifiable:
- *   the agent shell cannot reach ucdp.uu.se at all.
+ * @param fetch injectable transport returning
+ *   `{annual, candidate, candidateVersion}`. Defaults to the real downloads.
+ *   Injected by `mirror-ucdp.test.mjs`, which is the only way any of this is
+ *   verifiable: the agent shell cannot reach ucdp.uu.se at all.
+ * @param maxLagDays refuse to publish when the newest event is older than this.
+ *   Null disables the check, which is the default so the shaping tests can use
+ *   whatever dates they like; `main()` always passes a real ceiling.
  */
-export async function buildMirror({ now = new Date(), log = () => {}, fetch } = {}) {
-  const load = fetch ?? (() => fetchReleases(log));
-  const { annual, candidate } = await load();
+export async function buildMirror({
+  now = new Date(), log = () => {}, fetch, maxLagDays = null,
+} = {}) {
+  const load = fetch ?? (() => fetchReleases(log, now));
+  const { annual, candidate, candidateVersion = null } = await load();
 
   // Preserve last-good data when the annual base is missing.
   //
@@ -478,6 +628,20 @@ export async function buildMirror({ now = new Date(), log = () => {}, fetch } = 
   const newestMs = parseMs(capped[0].date_start);
   const oldestMs = parseMs(capped[capped.length - 1].date_start);
 
+  // The guard the 98-day freeze needed and did not have. Checked BEFORE the
+  // payload is returned, so a stale run writes nothing and leaves the last-good
+  // file in place — the same outcome as the freeze, except loud.
+  if (maxLagDays != null) {
+    const lagDays = Math.round((now.getTime() - newestMs) / 86_400_000);
+    if (lagDays > maxLagDays) {
+      throw new Error(
+        `newest event ${isoDay(newestMs)} is ${lagDays} days old, past the ${maxLagDays}-day `
+        + `ceiling. The candidate merge took ${candidateVersion ?? '(nothing)'}; either UCDP `
+        + 'has stopped publishing candidates or the probe is resolving an old release. '
+        + 'Refusing to publish — pass --allow-stale to override.');
+    }
+  }
+
   return {
     // Bumped only on a breaking shape change, so the app can refuse a payload
     // it cannot read instead of decoding it into nonsense. The move from the
@@ -487,7 +651,7 @@ export async function buildMirror({ now = new Date(), log = () => {}, fetch } = 
     schema: 1,
     generatedAt: new Date(now.getTime()).toISOString(),
     annualVersion: ANNUAL_VERSION,
-    candidateVersion: candidate.length ? CANDIDATE_VERSION : null,
+    candidateVersion: candidate.length ? candidateVersion : null,
     candidateComplete: candidate.length > 0,
     // The freshness signal that matters. A silently dead candidate merge is
     // otherwise invisible: the file keeps regenerating on schedule and stays
@@ -519,7 +683,10 @@ async function main() {
   console.log('  source: ucdp.uu.se static downloads (no credential)');
   console.log(`  out:   ${args.out}`);
 
-  const payload = await buildMirror({ log: (line) => console.log(line) });
+  const payload = await buildMirror({
+    log: (line) => console.log(line),
+    maxLagDays: args.allowStale ? null : MAX_CONTENT_LAG_DAYS,
+  });
 
   console.log(`\n  annual ${payload.annualVersion}`
     + ` | candidate ${payload.candidateVersion ?? '(none)'}`
@@ -529,11 +696,8 @@ async function main() {
 
   const lagDays = Math.round(
     (Date.now() - Date.parse(payload.newestEventAt)) / 86_400_000);
-  console.log(`  newest event is ${lagDays} days old`);
-  // ~30 days is a healthy candidate merge; ~210 means it silently died and we
-  // are back to annual-only data. Warn rather than fail: stale data still beats
-  // none, and the operator needs to know which they have.
-  if (lagDays > 90) console.warn(`  WARNING: content lag ${lagDays}d > 90d — is the candidate merge working?`);
+  const ceiling = args.allowStale ? 'waived' : `${MAX_CONTENT_LAG_DAYS}d`;
+  console.log(`  newest event is ${lagDays} days old (ceiling ${ceiling})`);
 
   if (args.dryRun) {
     console.log('\n  --dry-run: nothing written');

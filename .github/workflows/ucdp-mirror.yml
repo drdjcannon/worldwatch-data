@@ -8,6 +8,15 @@
 # which 401s without one. UCDP also publishes the same data as static CSV
 # downloads under CC BY 4.0 with no credential, so the script fetches those
 # instead and the workflow needs nothing configured to run.
+#
+# A GREEN RUN HERE IS NOT EVIDENCE OF FRESH DATA, and that is not theoretical:
+# a hardcoded candidate URL froze the published file at 2026-06-30 for 98 days
+# while this job completed successfully every week. A superseded UCDP release
+# does not 404, so the fetch succeeded, the payload came out byte-identical,
+# the script wrote nothing, the step below saw no diff, and nothing was wrong
+# anywhere a status could show it. The script now probes for the newest release
+# and refuses to publish content older than 90 days, so that shape of failure
+# turns this job red. Read `newestEventAt` in the step summary, not the tick.
 
 name: Mirror UCDP conflict data
 
@@ -64,14 +73,23 @@ jobs:
         # maintained from, so a CI-only failure is otherwise undiagnosable
         # without a human relaying it. Committing the tail costs nothing on a
         # green run and saves a round trip on a red one.
+        #
+        # The unchanged-log guard matters now that the build FAILS on stale
+        # content rather than warning: a recurring failure writes a
+        # byte-identical log, `git commit` exits 1 with "nothing to commit",
+        # and the step would report that instead of the real error.
         run: |
           git config user.name  'worldwatch-bot'
           git config user.email 'worldwatch-bot@users.noreply.github.com'
           mkdir -p ucdp
           tail -c 8000 /tmp/mirror.log > ucdp/last-error.log
           git add ucdp/last-error.log
-          git commit -m 'Mirror failed: publish the log for diagnosis'
-          git push
+          if git diff --cached --quiet; then
+            echo 'Error log unchanged since the last failure - nothing to publish.'
+          else
+            git commit -m 'Mirror failed: publish the log for diagnosis'
+            git push
+          fi
 
       # `git status --porcelain` covers both a modified file and a brand-new one,
       # which the script's own byte-identical check cannot (there is nothing to

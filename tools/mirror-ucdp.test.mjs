@@ -13,7 +13,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { capWithAnnualFloor, buildMirror, parseCsv, countryTotals } from './mirror-ucdp.mjs';
+import {
+  capWithAnnualFloor, buildMirror, parseCsv, countryTotals, candidateReleases,
+} from './mirror-ucdp.mjs';
 
 const DAY = 86_400_000;
 
@@ -29,13 +31,14 @@ function row(id, dateStart, extra = {}) {
     best: 5, low: 4, high: 7, type_of_violence: 1,
     side_a: 'Government of Sudan', side_b: 'RSF',
     where_coordinates: 'El Fasher', source_article: 'https://example.test/a',
+    where_prec: 1, date_prec: 1, event_clarity: 1,
     ...extra,
   };
 }
 
 /** Fake downloads: hands `buildMirror` the parsed rows it would have fetched. */
-function fakeReleases(annual = [], candidate = []) {
-  return async () => ({ annual, candidate });
+function fakeReleases(annual = [], candidate = [], candidateVersion = '26.01.26.09') {
+  return async () => ({ annual, candidate, candidateVersion });
 }
 
 // ---- CSV parsing ----
@@ -277,13 +280,145 @@ test('payload keeps UCDP field names so the app decoder is unchanged', async () 
   });
 
   assert.deepEqual(Object.keys(out.events[0]).sort(), [
-    'best', 'country', 'date_end', 'date_start', 'high', 'id', 'latitude',
-    'longitude', 'low', 'region', 'side_a', 'side_b', 'source_article',
-    'type_of_violence', 'where_coordinates',
+    'best', 'country', 'date_end', 'date_prec', 'date_start', 'event_clarity',
+    'high', 'id', 'latitude', 'longitude', 'low', 'region', 'side_a', 'side_b',
+    'source_article', 'type_of_violence', 'where_coordinates', 'where_prec',
   ]);
-  assert.equal(out.schema, 1);
+  assert.equal(out.schema, 1,
+    'the three precision fields are ADDITIVE - a schema bump breaks every shipped install');
   assert.match(out.attribution, /Uppsala/);
   assert.match(out.attribution, /CC BY 4\.0/);
+});
+
+// ---- The precision codes ----
+
+test('the three precision codes are published and coerced to numbers', async () => {
+  // UCDP tells consumers to honour these: where_prec 3+ is a province or
+  // country CENTROID, not an incident location, and date_prec above 1 means
+  // the event is placeable only to a week, month or year.
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 10), {
+      where_prec: '4', date_prec: '3', event_clarity: '2',
+    })], []),
+  });
+
+  const event = out.events[0];
+  assert.equal(event.where_prec, 4);
+  assert.equal(event.date_prec, 3);
+  assert.equal(event.event_clarity, 2);
+  assert.equal(typeof event.where_prec, 'number', 'CSV strings must be coerced');
+});
+
+test('a row missing the precision codes publishes 0, which means unknown', async () => {
+  // 0 is not a valid UCDP code for any of the three, so it cannot collide with
+  // a real value - and the app must treat it exactly as it treats the key being
+  // absent, which is as today's behaviour.
+  const anchor = Date.parse('2026-08-01T00:00:00Z');
+  const bare = row('a1', day(anchor, 10));
+  delete bare.where_prec; delete bare.date_prec; delete bare.event_clarity;
+
+  const out = await buildMirror({ now: new Date(anchor), fetch: fakeReleases([bare], []) });
+
+  assert.equal(out.events[0].where_prec, 0);
+  assert.equal(out.events[0].date_prec, 0);
+  assert.equal(out.events[0].event_clarity, 0);
+});
+
+// ---- Candidate probing ----
+//
+// The hardcoded candidate URL froze the mirror for 98 days while every weekly
+// run went green, because a superseded release does not 404 - it keeps serving.
+
+test('candidate releases run from the floor to this month, newest first', () => {
+  const releases = candidateReleases(new Date('2026-10-06T00:00:00Z'));
+
+  assert.deepEqual(releases.map((r) => r.version), [
+    '26.01.26.10', '26.01.26.09', '26.01.26.08', '26.01.26.07', '26.01.26.06',
+  ]);
+  assert.equal(releases[0].url,
+    'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_10.csv');
+  assert.equal(releases.at(-1).url,
+    'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv',
+    'the known-good floor must always be the last thing tried');
+});
+
+test('the month is zero-padded, matching UCDP filenames', () => {
+  const releases = candidateReleases(new Date('2026-07-01T00:00:00Z'));
+  assert.deepEqual(releases.map((r) => r.version), ['26.01.26.07', '26.01.26.06']);
+});
+
+test('the probe rolls over the year boundary', () => {
+  const releases = candidateReleases(new Date('2027-02-15T00:00:00Z'));
+  assert.equal(releases[0].version, '26.01.27.02');
+  assert.equal(releases[1].version, '26.01.27.01');
+  assert.equal(releases[2].version, '26.01.26.12');
+  assert.equal(releases.at(-1).version, '26.01.26.06');
+});
+
+test('a clock before the floor still yields the floor', () => {
+  // Degrade to today's behaviour rather than to an empty list.
+  const releases = candidateReleases(new Date('2026-01-01T00:00:00Z'));
+  assert.deepEqual(releases.map((r) => r.version), ['26.01.26.06']);
+});
+
+test('the probed version reaches the payload', async () => {
+  const anchor = Date.parse('2026-10-06T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('a1', day(anchor, 30))], [row('c1', day(anchor, 5))],
+      '26.01.26.09'),
+  });
+
+  assert.equal(out.candidateVersion, '26.01.26.09',
+    'the published version must be the one actually taken, not a constant');
+});
+
+// ---- The staleness ceiling ----
+
+test('refuses to publish when the newest event is past the lag ceiling', async () => {
+  // The guard the 98-day freeze needed. A green run that commits nothing is
+  // indistinguishable from a correctly idle one unless something checks the
+  // DATA's age.
+  //
+  // 99 days is the REAL lag measured on the live file on 2026-10-06, and it is
+  // in this test because the first ceiling I chose, 120, would have let it
+  // through. A guard calibrated loosely enough to miss its own motivating bug
+  // is decoration.
+  const anchor = Date.parse('2026-10-06T00:00:00Z');
+  await assert.rejects(
+    buildMirror({
+      now: new Date(anchor),
+      maxLagDays: 90,
+      fetch: fakeReleases([row('a1', day(anchor, 99))], []),
+    }),
+    /99 days old, past the 90-day ceiling/,
+  );
+});
+
+test('a healthy lag publishes normally', async () => {
+  // 58 days is the worst a working candidate merge produces: a release lands on
+  // the 21st covering through the end of the previous month, plus a week of our
+  // own weekly polling.
+  const anchor = Date.parse('2026-10-06T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    maxLagDays: 90,
+    fetch: fakeReleases([row('a1', day(anchor, 58))], []),
+  });
+
+  assert.equal(out.eventCount, 1);
+});
+
+test('the ceiling is off by default so the shaping tests are unaffected', async () => {
+  const anchor = Date.parse('2026-10-06T00:00:00Z');
+  const out = await buildMirror({
+    now: new Date(anchor),
+    fetch: fakeReleases([row('ancient', day(anchor, 300))], []),
+  });
+
+  assert.equal(out.eventCount, 1);
 });
 
 test('CSV strings are coerced to the numeric types the app expects', async () => {
