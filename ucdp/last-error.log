@@ -1,0 +1,23 @@
+=== UCDP mirror ===
+  source: ucdp.uu.se static downloads (no credential)
+  out:   ucdp/ucdp-events.json
+annual 26.1:
+  downloaded 37.3 MB
+  unzipped GEDEvent_v26_1.csv
+  parsed 417968 rows
+  newest annual date_start seen: 2025-12-31
+candidate: probing 5 releases, newest first
+  try https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_10.csv
+    miss: candidate 26.01.26.10: HTTP 404 
+  try https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_09.csv
+    miss: candidate 26.01.26.09: HTTP 404 
+  try https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_08.csv
+    miss: candidate 26.01.26.08: HTTP 404 
+  try https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_07.csv
+    miss: candidate 26.01.26.07: HTTP 404 
+  try https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv
+    TAKEN 26.01.26.06: 10051 rows, newest date_start 2026-06-30
+dedupe 428019 -> 428019, 1-year window from 2026-06-30 -> 22917
+country totals: 76 countries, 256,979 deaths
+cap 22917 -> 2000 (500 slots reserved for the annual base)
+FATAL: newest event 2026-06-30 is 99 days old, past the 90-day ceiling. The candidate merge took 26.01.26.06; either UCDP has stopped publishing candidates or the probe is resolving an old release. Refusing to publish — pass --allow-stale to override.
