@@ -505,6 +505,32 @@ async function probe(log, now) {
       }
       log(`  intensity_level in ${newest}: ${[...levels].map(([k, v]) => `${k}:${v}`).join('  ')}`);
       log(`  sample row: ${JSON.stringify(latest[0]).slice(0, 700)}`);
+
+      // **The surprising locations, in full.** The first published run put the
+      // United States and the United Kingdom in the classification, and
+      // "the United States is in an armed conflict" is the kind of claim that
+      // has to be read before it is shipped rather than after it is reported.
+      // UCDP's `location` is a coding convention, not necessarily an answer to
+      // "is there fighting in this country".
+      log(`\n  every ${newest} row naming a country a reader would not expect:`);
+      const unexpected = ['United States of America', 'United Kingdom', 'France',
+                          'Israel', 'Iran', 'Russia (Soviet Union)'];
+      for (const row of latest) {
+        if (!unexpected.some((name) => String(row.location).includes(name))) continue;
+        log(`    ${row.location} | ${row.side_a} vs ${row.side_b}`
+          + ` | intensity ${row.intensity_level} | type ${row.type_of_conflict}`
+          + ` | incompat ${row.incompatibility} | ep_end ${row.ep_end}`
+          + ` | gwno_loc ${row.gwno_loc}`);
+      }
+      // type_of_conflict: 1 extrasystemic, 2 interstate, 3 intrastate,
+      // 4 internationalised intrastate. A 4 is where a foreign government joins
+      // someone else's civil war, which is the case most likely to put a
+      // third country's name somewhere a reader will misread it.
+      const byType = new Map();
+      for (const row of latest) {
+        byType.set(row.type_of_conflict, (byType.get(row.type_of_conflict) ?? 0) + 1);
+      }
+      log(`  type_of_conflict in ${newest}: ${[...byType].sort().map(([k, v]) => `${k}:${v}`).join('  ')}`);
     }
   } catch (err) {
     log(`  FAILED: ${String(err.message).slice(0, 200)}`);
