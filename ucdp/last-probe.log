@@ -103,3 +103,13 @@ what the probe generator would try today:
   200  1353828 B  26.0.7  GEDEvent_v26_0_7.csv
   200  1337517 B  26.0.6  GEDEvent_v26_0_6.csv
   200  7776765 B  26.01.26.06  GEDEvent_v26_01_26_06.csv
+
+UCDP/PRIO Armed Conflict Dataset:
+  45 kB  https://ucdp.uu.se/downloads/ucdpprio/ucdp-prio-acd-261-csv.zip
+  unzipped UcdpPrioConflict_v26_1.csv
+  2816 rows
+  columns: conflict_id, location, side_a, side_a_id, side_a_2nd, side_b, side_b_id, side_b_2nd, incompatibility, territory_name, year, intensity_level, cumulative_intensity, type_of_conflict, start_date, start_prec, start_date2, start_prec2, ep_end, ep_end_date, ep_end_prec, gwno_a, gwno_a_2nd, gwno_b, gwno_b_2nd, gwno_loc, region, version
+  year range: 1946 to 2025
+  65 conflict-years in 2025
+  intensity_level in 2025: 1:52  2:13
+  sample row: {"conflict_id":"209","location":"Philippines","side_a":"Government of Philippines","side_a_id":"154","side_a_2nd":"","side_b":"CPP","side_b_id":"169","side_b_2nd":"","incompatibility":"2","territory_name":"","year":"2025","intensity_level":"1","cumulative_intensity":"1","type_of_conflict":"3","start_date":"1946-07-31","start_prec":"4","start_date2":"1999-06-06","start_prec2":"1","ep_end":"0","ep_end_date":"","ep_end_prec":"","gwno_a":"840","gwno_a_2nd":"","gwno_b":"","gwno_b_2nd":"","gwno_loc":"840","region":"3","version":"26.1"}
