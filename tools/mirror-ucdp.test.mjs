@@ -15,6 +15,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   capWithAnnualFloor, buildMirror, parseCsv, countryTotals, candidateReleases,
+  conflictClassification,
 } from './mirror-ucdp.mjs';
 
 const DAY = 86_400_000;
@@ -469,4 +470,103 @@ test('CSV strings are coerced to the numeric types the app expects', async () =>
   assert.equal(event.best, 7);
   assert.equal(typeof event.type_of_violence, 'number');
   assert.equal(event.id, 'a1', 'id stays a string');
+});
+
+// ---- UCDP's own war/minor classification ----
+//
+// The Armed Conflict Dataset answers authoritatively what `ConflictClassifier`
+// currently derives from thresholds transcribed out of World Monitor. Measured
+// 2026-10-06: 2,816 rows, years 1946 to 2025, 65 conflict-years in the newest
+// year split 52 minor and 13 war.
+
+/** One ACD conflict-year. Field names and codes are UCDP's own. */
+function acd(location, year, level, extra = {}) {
+  return {
+    conflict_id: '209', location, year: String(year),
+    intensity_level: String(level), ep_end: '0', type_of_conflict: '3',
+    side_a: 'Government', side_b: 'Rebels', region: '3', version: '26.1',
+    ...extra,
+  };
+}
+
+test('only the newest year counts', () => {
+  // One row per conflict-year back to 1946. A country at war in 1998 is not a
+  // country at war now.
+  const out = conflictClassification([
+    acd('Cambodia', 1998, 2), acd('Philippines', 2025, 1),
+  ]);
+  assert.equal(out.year, 2025);
+  assert.deepEqual(out.countries.map((c) => c.country), ['Philippines']);
+});
+
+test('an episode that ENDED in that year is not a current conflict', () => {
+  // ep_end 1 means the episode finished. Since the newest year is already ten
+  // months old, including it would report a finished war as ongoing for a year.
+  const out = conflictClassification([
+    acd('Ethiopia', 2025, 2, { ep_end: '1' }),
+    acd('Myanmar (Burma)', 2025, 1),
+  ]);
+  assert.deepEqual(out.countries.map((c) => c.country), ['Myanmar (Burma)']);
+  assert.equal(out.endedEpisodesExcluded, 1, 'and it is counted, not silently dropped');
+});
+
+test('a multi-country conflict reaches every country it names', () => {
+  // UCDP writes these as "DR Congo (Zaire), Rwanda". A whole-string key joins
+  // to neither country.
+  const out = conflictClassification([acd('DR Congo (Zaire), Rwanda', 2025, 2)]);
+  assert.deepEqual(out.countries.map((c) => c.country).sort(),
+    ['DR Congo (Zaire)', 'Rwanda']);
+  assert.ok(out.countries.every((c) => c.intensity === 'war'));
+});
+
+test('the highest intensity wins where a country has several conflicts', () => {
+  // One war and four insurgencies is a country at war.
+  const out = conflictClassification([
+    acd('Nigeria', 2025, 1), acd('Nigeria', 2025, 2), acd('Nigeria', 2025, 1),
+  ]);
+  assert.equal(out.countries.length, 1);
+  assert.equal(out.countries[0].intensity, 'war');
+  assert.equal(out.countries[0].conflicts, 3);
+});
+
+test('intensity is published as a word, not UCDP\'s code', () => {
+  // The payload should say what it means; the app should not need the codebook.
+  const out = conflictClassification([acd('Sudan', 2025, 2), acd('Mali', 2025, 1)]);
+  assert.equal(out.countries.find((c) => c.country === 'Sudan').intensity, 'war');
+  assert.equal(out.countries.find((c) => c.country === 'Mali').intensity, 'minor');
+});
+
+test('wars sort first', () => {
+  const out = conflictClassification([acd('Mali', 2025, 1), acd('Sudan', 2025, 2)]);
+  assert.deepEqual(out.countries.map((c) => c.country), ['Sudan', 'Mali']);
+});
+
+test('an out-of-range intensity is dropped rather than guessed at', () => {
+  const out = conflictClassification([acd('Nowhere', 2025, 9), acd('Mali', 2025, 1)]);
+  assert.deepEqual(out.countries.map((c) => c.country), ['Mali']);
+});
+
+test('an empty dataset publishes null rather than an empty claim', () => {
+  assert.equal(conflictClassification([]), null);
+});
+
+test('the classification rides in the payload and is optional', async () => {
+  // Additive at schema 1: an app that has never heard of it ignores the key,
+  // and a fetch failure costs authority rather than data.
+  const anchor = Date.parse('2026-10-06T00:00:00Z');
+  const withIt = await buildMirror({
+    now: new Date(anchor),
+    fetch: async () => ({
+      annual: [row('a1', day(anchor, 30))], candidate: [], candidateVersion: null,
+      classification: conflictClassification([acd('Sudan', 2025, 2)]),
+    }),
+  });
+  assert.equal(withIt.schema, 1);
+  assert.equal(withIt.conflictClassification.countries[0].country, 'Sudan');
+
+  const without = await buildMirror({
+    now: new Date(anchor), fetch: fakeReleases([row('a1', day(anchor, 30))], []),
+  });
+  assert.equal(without.conflictClassification, null);
+  assert.equal(without.eventCount, 1, 'and the events are unaffected');
 });

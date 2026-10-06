@@ -69,6 +69,26 @@ const ANNUAL_URL = 'https://ucdp.uu.se/downloads/ged/ged261-csv.zip';
 const ANNUAL_VERSION = '26.1';
 
 /**
+ * UCDP/PRIO Armed Conflict Dataset: UCDP's OWN war/minor classification.
+ *
+ * `ConflictClassifier` in the app derives that from thresholds transcribed out
+ * of World Monitor and applied to our one-year GED window. This is the
+ * authoritative answer for the same question, from the people who code the
+ * events.
+ *
+ * **It cannot replace the derived classification, and the measurement is why.**
+ * Probed 2026-10-06: 2,816 rows, years 1946 to **2025**, so on an October 2026
+ * clock the newest conflict-year is ten months old and a conflict that began or
+ * escalated in 2026 is simply absent. Published as a FLOOR for the app to layer
+ * over its own derivation, never as a replacement - the same shape as the
+ * `ucdpFloor` already in `InstabilityScore`.
+ *
+ * 45 kB zipped, so the cost of fetching it is nothing next to the annual's 37 MB.
+ */
+const ACD_URL = 'https://ucdp.uu.se/downloads/ucdpprio/ucdp-prio-acd-261-csv.zip';
+const ACD_VERSION = '26.1';
+
+/**
  * How the candidate files are named, measured rather than assumed.
  *
  * **UCDP renamed them, and that is why the mirror froze.** The pinned URL was
@@ -492,6 +512,89 @@ async function probe(log, now) {
 }
 
 /**
+ * Per-country conflict classification from UCDP's own Armed Conflict Dataset.
+ *
+ * Exported and pure so it is testable without network, like everything else
+ * here that matters.
+ *
+ * Four decisions, each of which changes the answer:
+ *
+ * - **Only the newest year in the file.** ACD is one row per conflict-year back
+ *   to 1946; a country at war in 1998 is not a country at war now.
+ * - **`ep_end == 1` rows are dropped.** That flag means the episode ENDED in
+ *   that year, so including it would report a finished war as ongoing - and
+ *   since the newest year is already ten months old, that error would persist
+ *   for a year.
+ * - **`location` is split**, because UCDP writes multi-country conflicts as
+ *   "DR Congo (Zaire), Rwanda" and a whole-string key would join to neither.
+ *   The spellings are UCDP's own, which is what GED's `country` already is, so
+ *   the app's existing country mapping covers both with no new table.
+ * - **The highest intensity wins** where a country has several conflicts: a
+ *   country with one war and four minor insurgencies is at war.
+ *
+ * `intensity_level` is UCDP's: 1 is minor (25-999 battle deaths in the year),
+ * 2 is war (1,000+). Published as those words rather than the codes, so the
+ * payload says what it means and the app does not need the codebook.
+ */
+export function conflictClassification(rows) {
+  const years = rows.map((row) => Number(row.year)).filter(Number.isFinite);
+  if (!years.length) return null;
+  const year = Math.max(...years);
+
+  const byCountry = new Map();
+  let ended = 0;
+  for (const row of rows) {
+    if (Number(row.year) !== year) continue;
+    // The episode finished in this year. Not a current conflict.
+    if (String(row.ep_end).trim() === '1') { ended++; continue; }
+    const level = Number(row.intensity_level);
+    if (level !== 1 && level !== 2) continue;
+    for (const name of String(row.location || '').split(',')) {
+      const country = name.trim();
+      if (!country) continue;
+      const entry = byCountry.get(country) ?? { country, level: 0, conflicts: 0 };
+      entry.level = Math.max(entry.level, level);
+      entry.conflicts += 1;
+      byCountry.set(country, entry);
+    }
+  }
+
+  const countries = [...byCountry.values()]
+    .map(({ country, level, conflicts }) => ({
+      country, conflicts, intensity: level === 2 ? 'war' : 'minor',
+    }))
+    .sort((a, b) => (a.intensity === b.intensity
+      ? b.conflicts - a.conflicts
+      : (a.intensity === 'war' ? -1 : 1)));
+
+  return { version: ACD_VERSION, year, endedEpisodesExcluded: ended, countries };
+}
+
+/**
+ * Fetch the Armed Conflict Dataset. Never fatal: it is a floor the app layers
+ * over its own derivation, so its absence costs authority rather than data,
+ * exactly as the candidate's absence would cost recency rather than data.
+ */
+async function fetchClassification(log) {
+  log(`armed conflict dataset ${ACD_VERSION}:`);
+  try {
+    const zip = await download(ACD_URL, `acd ${ACD_VERSION}`);
+    const rows = parseCsv(stripBom(unzipFirstCsv(zip, log)));
+    const out = conflictClassification(rows);
+    if (!out) { log('  no usable rows'); return null; }
+    const wars = out.countries.filter((c) => c.intensity === 'war');
+    log(`  ${rows.length} conflict-years, newest ${out.year}: `
+      + `${out.countries.length} countries, ${wars.length} at war `
+      + `(${out.endedEpisodesExcluded} ended episodes excluded)`);
+    log(`  at war: ${wars.map((c) => c.country).join(', ')}`);
+    return out;
+  } catch (err) {
+    log(`  skipped: ${String(err.message).slice(0, 140)}`);
+    return null;
+  }
+}
+
+/**
  * Fetch both releases. Injectable so the tests can run without network — the
  * agent shell cannot reach ucdp.uu.se at all.
  */
@@ -504,7 +607,13 @@ async function fetchReleases(log, now) {
   if (annual.length) log(`  newest annual date_start seen: ${maxIsoDay(annual)}`);
 
   const candidate = await fetchCandidate(log, now);
-  return { annual, candidate: candidate.rows, candidateVersion: candidate.version };
+  const classification = await fetchClassification(log);
+  return {
+    annual,
+    candidate: candidate.rows,
+    candidateVersion: candidate.version,
+    classification,
+  };
 }
 
 // ---- Shaping ----
@@ -668,7 +777,7 @@ export async function buildMirror({
   now = new Date(), log = () => {}, fetch, maxLagDays = null,
 } = {}) {
   const load = fetch ?? (() => fetchReleases(log, now));
-  const { annual, candidate, candidateVersion = null } = await load();
+  const { annual, candidate, candidateVersion = null, classification = null } = await load();
 
   // Preserve last-good data when the annual base is missing.
   //
@@ -770,6 +879,11 @@ export async function buildMirror({
     // it, so summing that gives a real total of the wrong population — which is
     // exactly the bug these exist to fix.
     countryTotals: totals,
+    // UCDP's OWN war/minor classification, additive at schema 1. Null when the
+    // Armed Conflict Dataset could not be fetched, which costs authority rather
+    // than data: the app layers this over its own derivation as a floor and
+    // falls back to deriving alone. See `conflictClassification`.
+    conflictClassification: classification,
     attribution: 'Uppsala Conflict Data Program (UCDP) Georeferenced Event Dataset, '
       + 'Department of Peace and Conflict Research, Uppsala University. CC BY 4.0. '
       + 'Davies, Pettersson, Öberg (2026) Journal of Peace Research; '
