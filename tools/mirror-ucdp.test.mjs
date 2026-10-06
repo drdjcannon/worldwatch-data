@@ -37,7 +37,7 @@ function row(id, dateStart, extra = {}) {
 }
 
 /** Fake downloads: hands `buildMirror` the parsed rows it would have fetched. */
-function fakeReleases(annual = [], candidate = [], candidateVersion = '26.01.26.09') {
+function fakeReleases(annual = [], candidate = [], candidateVersion = '26.0.8') {
   return async () => ({ annual, candidate, candidateVersion });
 }
 
@@ -330,37 +330,66 @@ test('a row missing the precision codes publishes 0, which means unknown', async
 //
 // The hardcoded candidate URL froze the mirror for 98 days while every weekly
 // run went green, because a superseded release does not 404 - it keeps serving.
+// Worse, UCDP had also RENAMED the files, so incrementing the month in the old
+// name (the obvious fix) produces nothing but 404s. The names below are the
+// ones a CI probe measured on the live downloads page on 2026-10-06.
 
-test('candidate releases run from the floor to this month, newest first', () => {
+test('candidate names use the measured v{YY}_0_{M} convention, newest first', () => {
+  // Measured: GEDEvent_v26_0_7.csv and GEDEvent_v26_0_8.csv both answer 200,
+  // while every GEDEvent_v26_01_26_MM spelling after the floor answers 404.
   const releases = candidateReleases(new Date('2026-10-06T00:00:00Z'));
 
   assert.deepEqual(releases.map((r) => r.version), [
-    '26.01.26.10', '26.01.26.09', '26.01.26.08', '26.01.26.07', '26.01.26.06',
+    '26.0.11', '26.0.10', '26.0.9', '26.0.8', '26.0.7', '26.0.6', '26.01.26.06',
   ]);
-  assert.equal(releases[0].url,
-    'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_10.csv');
-  assert.equal(releases.at(-1).url,
-    'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv',
-    'the known-good floor must always be the last thing tried');
+  assert.equal(releases[3].url,
+    'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_0_8.csv',
+    'this exact URL was measured at 200, 1,436,409 bytes');
 });
 
-test('the month is zero-padded, matching UCDP filenames', () => {
-  const releases = candidateReleases(new Date('2026-07-01T00:00:00Z'));
-  assert.deepEqual(releases.map((r) => r.version), ['26.01.26.07', '26.01.26.06']);
+test('the month is NOT zero-padded', () => {
+  // GEDEvent_v26_0_7.csv resolves; GEDEvent_v26_01_26_07.csv does not. One
+  // character, and getting it wrong is three months of missing data.
+  const releases = candidateReleases(new Date('2026-09-15T00:00:00Z'));
+  assert.ok(releases.some((r) => r.url.endsWith('GEDEvent_v26_0_9.csv')));
+  assert.ok(!releases.some((r) => r.url.includes('_09.csv')),
+    'a padded month would silently 404 forever');
 });
 
-test('the probe rolls over the year boundary', () => {
-  const releases = candidateReleases(new Date('2027-02-15T00:00:00Z'));
-  assert.equal(releases[0].version, '26.01.27.02');
-  assert.equal(releases[1].version, '26.01.27.01');
-  assert.equal(releases[2].version, '26.01.26.12');
-  assert.equal(releases.at(-1).version, '26.01.26.06');
+test('one month ahead is probed first', () => {
+  // A release could be labelled by its publication month rather than by the
+  // month it covers. One extra 404 is cheaper than missing a month.
+  const releases = candidateReleases(new Date('2026-10-06T00:00:00Z'));
+  assert.equal(releases[0].version, '26.0.11');
 });
 
-test('a clock before the floor still yields the floor', () => {
-  // Degrade to today's behaviour rather than to an empty list.
-  const releases = candidateReleases(new Date('2026-01-01T00:00:00Z'));
-  assert.deepEqual(releases.map((r) => r.version), ['26.01.26.06']);
+test('the window rolls over the year boundary', () => {
+  // Upstream wrote this branch by hand and its comment records that omitting it
+  // "silently narrowed the window to 5 every December". Date.UTC does it here.
+  const releases = candidateReleases(new Date('2026-12-20T00:00:00Z'));
+  assert.equal(releases[0].version, '27.0.1', 'January of the next year');
+  assert.equal(releases[1].version, '26.0.12');
+  assert.equal(releases.at(-2).version, '26.0.8');
+});
+
+test('the legacy name is always tried last and never first', () => {
+  // The degradation path: a probe that finds nothing falls back to exactly what
+  // the mirror served before any of this, rather than to nothing.
+  for (const when of ['2026-10-06', '2027-03-01', '2026-07-01']) {
+    const releases = candidateReleases(new Date(`${when}T00:00:00Z`));
+    assert.equal(releases.at(-1).version, '26.01.26.06', `last at ${when}`);
+    assert.equal(releases.at(-1).url,
+      'https://ucdp.uu.se/downloads/candidateged/GEDEvent_v26_01_26_06.csv');
+    assert.notEqual(releases[0].version, '26.01.26.06');
+  }
+});
+
+test('the probe window stays a constant size as time passes', () => {
+  // Walking back to a fixed floor would add a 404 every month forever. Anything
+  // older than the window is the staleness ceiling's problem, not the probe's.
+  const sizes = ['2026-10-06', '2027-10-06', '2030-01-01']
+    .map((when) => candidateReleases(new Date(`${when}T00:00:00Z`)).length);
+  assert.deepEqual(sizes, [7, 7, 7]);
 });
 
 test('the probed version reaches the payload', async () => {
@@ -368,10 +397,10 @@ test('the probed version reaches the payload', async () => {
   const out = await buildMirror({
     now: new Date(anchor),
     fetch: fakeReleases([row('a1', day(anchor, 30))], [row('c1', day(anchor, 5))],
-      '26.01.26.09'),
+      '26.0.8'),
   });
 
-  assert.equal(out.candidateVersion, '26.01.26.09',
+  assert.equal(out.candidateVersion, '26.0.8',
     'the published version must be the one actually taken, not a constant');
 });
 

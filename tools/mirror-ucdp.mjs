@@ -68,38 +68,51 @@ import { execFileSync } from 'node:child_process';
 const ANNUAL_URL = 'https://ucdp.uu.se/downloads/ged/ged261-csv.zip';
 const ANNUAL_VERSION = '26.1';
 
+/**
+ * How the candidate files are named, measured rather than assumed.
+ *
+ * **UCDP renamed them, and that is why the mirror froze.** The pinned URL was
+ * `GEDEvent_v26_01_26_06.csv`. Probing the downloads page from CI on
+ * 2026-10-06 found it still serving, and found the releases after it published
+ * as `GEDEvent_v26_0_7.csv` and `GEDEvent_v26_0_8.csv` — a different shape
+ * entirely, with an unpadded month. Every `v26_01_26_{07..10}` spelling 404s.
+ *
+ * So the freeze had two causes stacked, and only one was the pin: the file was
+ * pinned, AND the name it was pinned to stopped being the pattern. Incrementing
+ * the month in the old name — the obvious fix, and the first one tried here —
+ * produces four 404s and changes nothing.
+ *
+ * `{YY}_0_{M}` is also exactly the shape worldmonitor's `buildCandidateVersions`
+ * has always probed for the REST API (`${year}.0.${month}`), which is the hint
+ * that was sitting in a local checkout the whole time.
+ */
 const CANDIDATE_DIR = 'https://ucdp.uu.se/downloads/candidateged/';
 
 /**
- * The annual release the candidate files extend, as it is spelled in their
- * filenames: `GEDEvent_v26_01_<YY>_<MM>.csv`. Bump when ANNUAL_URL bumps.
+ * Months probed, newest first, starting one AHEAD of the current month.
+ *
+ * Six, matching the window worldmonitor has used for years. One ahead because
+ * a release could be labelled by its publication month rather than by the month
+ * it covers, and a single extra 404 is cheaper than missing a month. Bounded
+ * rather than walking back to a fixed floor, so the number of probes stays
+ * constant instead of growing by one every month forever — anything older than
+ * six months is the staleness ceiling's problem, not the probe's.
  */
-const CANDIDATE_LINEAGE = '26_01';
+const CANDIDATE_LOOKBACK_MONTHS = 6;
 
 /**
- * The oldest candidate release we will accept, and the reason this file probes
- * at all.
+ * The last file published under the OLD naming convention, tried after every
+ * modern name has missed.
  *
- * **The hardcoded URL this replaced froze the mirror for 98 days.** It named
- * `GEDEvent_v26_01_26_06.csv`, and the comment above it argued that a version
- * UCDP had moved past would be "a 404, which fails the run loudly". It is not.
- * The June file keeps serving perfectly, so the fetch succeeded, the payload
- * came out byte-identical, the script wrote nothing, the workflow's
- * `git status --porcelain` saw no change, and every weekly run went green while
- * three monthly releases came and went. A stale pin does not 404; it just
- * quietly keeps answering.
- *
- * So: generate every release from this floor to the current month, try them
- * newest-first, and take the first that both resolves AND parses. The floor is
- * the known-good file, so a failed probe degrades to exactly the old behaviour
- * rather than to nothing — and if even the floor is gone, THAT is the loud
- * failure the old comment wanted, because it means UCDP renamed the files.
- *
- * Note the probe is cheap in the only case that matters: a miss is a 404 with a
- * few hundred bytes of body, and only the file we actually take is downloaded in
- * full.
+ * This is the degradation path: a probe that finds nothing falls back to
+ * exactly what the mirror served before any of this, rather than to nothing.
+ * Note the staleness ceiling will then refuse to publish it, which is correct —
+ * reaching this entry means UCDP has renamed the files again.
  */
-const CANDIDATE_FLOOR = { year: 26, month: 6 };
+const LEGACY_CANDIDATE = Object.freeze({
+  version: '26.01.26.06',
+  url: `${CANDIDATE_DIR}GEDEvent_v26_01_26_06.csv`,
+});
 
 /**
  * Hard ceiling on how old the newest published event may be, in days.
@@ -305,42 +318,31 @@ function stripBom(text) {
 }
 
 /**
- * Every candidate release from the floor to `now`, NEWEST FIRST.
+ * Every candidate release worth trying, NEWEST FIRST.
  *
  * Pure and exported so the generation is testable without network — which
  * matters here more than usual, because ucdp.uu.se is unreachable from the
  * machine this repo is maintained from, so CI is the only place the real URLs
  * are ever exercised.
  *
- * The ceiling is the current calendar month rather than the previous one even
- * though a release covers the month before it is published. Two reasons: the
- * filename convention could name either the covered month or the publication
- * month, and probing one extra month that does not exist costs a single 404.
- * Guessing which convention it is, and guessing wrong, costs a month of data.
+ * `Date.UTC` with an out-of-range month does the year arithmetic, so December
+ * rolls to January without a special case. Upstream had that branch written by
+ * hand and its comment records that omitting it "silently narrowed the window
+ * to 5 every December".
  */
-export function candidateReleases(
-  now = new Date(), floor = CANDIDATE_FLOOR, lineage = CANDIDATE_LINEAGE,
-) {
-  const pad = (value) => String(value).padStart(2, '0');
-  const endYear = now.getUTCFullYear() % 100;
-  const endMonth = now.getUTCMonth() + 1;
-
+export function candidateReleases(now = new Date(), lookback = CANDIDATE_LOOKBACK_MONTHS) {
   const out = [];
-  let { year, month } = floor;
-  // Bounded rather than `while (true)`: a clock or a floor far enough wrong to
-  // spin forever should produce a short wrong list, not hang a CI job.
-  for (let guard = 0; guard < 120; guard++) {
-    const stem = `GEDEvent_v${lineage}_${pad(year)}_${pad(month)}`;
+  for (let offset = 1; offset > 1 - lookback; offset--) {
+    const month = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + offset, 1));
+    const yy = month.getUTCFullYear() % 100;
+    const mm = month.getUTCMonth() + 1;
     out.push({
-      version: `${lineage.replace('_', '.')}.${pad(year)}.${pad(month)}`,
-      url: `${CANDIDATE_DIR}${stem}.csv`,
+      version: `${yy}.0.${mm}`,
+      url: `${CANDIDATE_DIR}GEDEvent_v${yy}_0_${mm}.csv`,
     });
-    // The floor is always included, even when `now` is before it.
-    if (year > endYear || (year === endYear && month >= endMonth)) break;
-    month += 1;
-    if (month > 12) { month = 1; year += 1; }
   }
-  return out.reverse();
+  out.push(LEGACY_CANDIDATE);
+  return out;
 }
 
 /**
@@ -381,9 +383,10 @@ async function fetchCandidate(log, now) {
 
   throw new Error(
     `no candidate release resolved. Tried ${attempts.map((a) => a.version).join(', ')} `
-    + `— including the ${attempts[attempts.length - 1].version} floor, which has served `
-    + 'since 2026-08. UCDP has most likely renamed the candidate files; check '
-    + 'ucdp.uu.se/downloads and update CANDIDATE_LINEAGE / CANDIDATE_FLOOR.');
+    + `— including the ${LEGACY_CANDIDATE.version} legacy file, which served from 2026-06 `
+    + 'until UCDP renamed the releases. They have most likely renamed them again; run this '
+    + 'workflow with probe=true and read ucdp/last-probe.log for what the downloads page '
+    + 'actually lists.');
 }
 
 /**
@@ -434,24 +437,11 @@ async function probe(log, now) {
     log(`candidate paths mentioned: ${dirs.join(', ') || '(none)'}`);
   }
 
-  // Alternative conventions, for the months after the floor. Each is a real
-  // spelling used somewhere in UCDP's own history or implied by upstream's API
-  // version format (`{YY}.0.{M}`, which is NOT what the floor filename uses).
-  const months = [];
-  for (let m = CANDIDATE_FLOOR.month + 1; m <= now.getUTCMonth() + 1; m++) months.push(m);
-  const pad = (v) => String(v).padStart(2, '0');
-
-  log('\nnaming conventions, months after the floor:');
-  for (const m of months) {
-    for (const stem of [
-      `GEDEvent_v26_01_26_${pad(m)}`,   // the floor's own spelling, incremented
-      `GEDEvent_v26_01_26_${m}`,        // unpadded month
-      `GEDEvent_v26_0_${m}`,            // upstream's API version shape
-      `GEDEvent_v26_02_26_${pad(m)}`,   // candidate lineage bumped
-      `GEDEvent_v27_01_26_${pad(m)}`,   // annual lineage bumped
-    ]) {
-      await show(`${stem}.csv`, `${CANDIDATE_DIR}${stem}.csv`);
-    }
+  // Whatever the generator would try today, so a future rename shows up as a
+  // column of 404s next to the names the page actually lists.
+  log('\nwhat the probe generator would try today:');
+  for (const { version, url } of candidateReleases(now)) {
+    await show(`${version}  ${url.split('/').pop()}`, url);
   }
 }
 
