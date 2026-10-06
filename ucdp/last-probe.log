@@ -113,3 +113,14 @@ UCDP/PRIO Armed Conflict Dataset:
   65 conflict-years in 2025
   intensity_level in 2025: 1:52  2:13
   sample row: {"conflict_id":"209","location":"Philippines","side_a":"Government of Philippines","side_a_id":"154","side_a_2nd":"","side_b":"CPP","side_b_id":"169","side_b_2nd":"","incompatibility":"2","territory_name":"","year":"2025","intensity_level":"1","cumulative_intensity":"1","type_of_conflict":"3","start_date":"1946-07-31","start_prec":"4","start_date2":"1999-06-06","start_prec2":"1","ep_end":"0","ep_end_date":"","ep_end_prec":"","gwno_a":"840","gwno_a_2nd":"","gwno_b":"","gwno_b_2nd":"","gwno_loc":"840","region":"3","version":"26.1"}
+
+  every 2025 row naming a country a reader would not expect:
+    Israel | Government of Israel vs Hamas, Palestinian Mujahideen Movement, PIJ, PRC | intensity 2 | type 3 | incompat 1 | ep_end 0 | gwno_loc 666
+    Israel, Syria | Government of Israel vs Government of Syria | intensity 1 | type 2 | incompat 1 | ep_end 0 | gwno_loc 652, 666
+    Iran | Government of Iran vs Jaish al-Adl | intensity 1 | type 3 | incompat 2 | ep_end 0 | gwno_loc 630
+    Israel | Government of Israel vs Hezbollah | intensity 1 | type 3 | incompat 1 | ep_end 0 | gwno_loc 666
+    Russia (Soviet Union), Ukraine | Government of Russia (Soviet Union) vs Government of Ukraine | intensity 2 | type 2 | incompat 3 | ep_end 0 | gwno_loc 365, 369
+    Iran, Israel | Government of Iran vs Government of Israel | intensity 2 | type 2 | incompat 2 | ep_end 0 | gwno_loc 630, 666
+    United Kingdom, United States of America, Yemen (North Yemen) | Government of United Kingdom, Government of United States of America vs Government of Yemen (North Yemen) | intensity 1 | type 2 | incompat 1 | ep_end 0 | gwno_loc 2, 200, 678
+    Israel, Yemen (North Yemen) | Government of Israel vs Government of Yemen (North Yemen) | intensity 1 | type 2 | incompat 2 | ep_end 0 | gwno_loc 666, 678
+  type_of_conflict in 2025: 2:8  3:35  4:22
