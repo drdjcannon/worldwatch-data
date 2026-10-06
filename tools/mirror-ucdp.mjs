@@ -455,6 +455,40 @@ async function probe(log, now) {
   for (const { version, url } of candidateReleases(now)) {
     await show(`${version}  ${url.split('/').pop()}`, url);
   }
+
+  // UCDP/PRIO Armed Conflict Dataset, the one dataset on the list worth taking
+  // next: it carries UCDP's OWN war/minor classification per conflict-year,
+  // where `ConflictClassifier` currently approximates it with thresholds
+  // transcribed out of World Monitor and applied to a 2,000-event slice.
+  //
+  // The shape is DUMPED rather than recalled. Twice this session a remembered
+  // convention was wrong - the candidate filename, and `date_prec` 4 meaning a
+  // month when the data says 8 to 16 days - and both were caught only by
+  // looking. A column list is cheap; a wrong one is a silent mis-join.
+  log('\nUCDP/PRIO Armed Conflict Dataset:');
+  const acd = 'https://ucdp.uu.se/downloads/ucdpprio/ucdp-prio-acd-261-csv.zip';
+  try {
+    const zip = await download(acd, 'acd');
+    log(`  ${(zip.length / 1024).toFixed(0)} kB  ${acd}`);
+    const rows = parseCsv(stripBom(unzipFirstCsv(zip, log)));
+    log(`  ${rows.length} rows`);
+    if (rows.length) {
+      log(`  columns: ${Object.keys(rows[0]).join(', ')}`);
+      const years = rows.map((r) => Number(r.year)).filter(Number.isFinite);
+      log(`  year range: ${Math.min(...years)} to ${Math.max(...years)}`);
+      const newest = String(Math.max(...years));
+      const latest = rows.filter((r) => String(r.year) === newest);
+      log(`  ${latest.length} conflict-years in ${newest}`);
+      const levels = new Map();
+      for (const r of latest) {
+        levels.set(r.intensity_level, (levels.get(r.intensity_level) ?? 0) + 1);
+      }
+      log(`  intensity_level in ${newest}: ${[...levels].map(([k, v]) => `${k}:${v}`).join('  ')}`);
+      log(`  sample row: ${JSON.stringify(latest[0]).slice(0, 700)}`);
+    }
+  } catch (err) {
+    log(`  FAILED: ${String(err.message).slice(0, 200)}`);
+  }
 }
 
 /**
