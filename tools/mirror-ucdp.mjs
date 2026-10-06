@@ -387,6 +387,75 @@ async function fetchCandidate(log, now) {
 }
 
 /**
+ * Report what UCDP actually publishes, and stop. `--probe`.
+ *
+ * **This exists because guessing cost a CI round.** The first probe generated
+ * `GEDEvent_v26_01_26_{07..10}.csv` by incrementing the month in the known-good
+ * floor's name, and all four answered 404 while `26_06` served perfectly — so
+ * either UCDP has published nothing since June, or the filename convention is
+ * not the one that name suggests. Those are opposite conclusions and no amount
+ * of reasoning from here separates them: ucdp.uu.se is unreachable from the
+ * machine this repo is maintained from, and only CI can see it.
+ *
+ * So this asks three questions in one run, cheaply, and prints the answers:
+ * what the downloads page links to, whether the candidate directory lists
+ * itself, and which of several plausible naming conventions resolve. A miss is
+ * a 404 with a few hundred bytes of body, so the whole sweep costs less than
+ * one real download.
+ */
+async function probe(log, now) {
+  const show = async (label, url) => {
+    try {
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': UA, Accept: '*/*' },
+        signal: AbortSignal.timeout(60_000),
+      });
+      const body = await resp.text().catch(() => '');
+      log(`  ${resp.status} ${String(body.length).padStart(8)} B  ${label}`);
+      return resp.ok ? body : null;
+    } catch (err) {
+      log(`  ERR ${label}: ${String(err.message).slice(0, 100)}`);
+      return null;
+    }
+  };
+
+  log('pages:');
+  const page = await show('downloads page', 'https://ucdp.uu.se/downloads/');
+  await show('candidateged directory', CANDIDATE_DIR);
+
+  // Every GED-shaped filename the page mentions, however it is spelled. A
+  // substring scan rather than an href parse on purpose: the links may be built
+  // by script, and the filename is the only thing actually needed.
+  if (page) {
+    const names = [...new Set(page.match(/GEDEvent[A-Za-z0-9_.-]*/g) ?? [])].sort();
+    log(`\ndownloads page mentions ${names.length} GEDEvent filenames:`);
+    for (const name of names) log(`  ${name}`);
+    const dirs = [...new Set(page.match(/[A-Za-z0-9_/-]*candidate[A-Za-z0-9_/-]*/gi) ?? [])];
+    log(`candidate paths mentioned: ${dirs.join(', ') || '(none)'}`);
+  }
+
+  // Alternative conventions, for the months after the floor. Each is a real
+  // spelling used somewhere in UCDP's own history or implied by upstream's API
+  // version format (`{YY}.0.{M}`, which is NOT what the floor filename uses).
+  const months = [];
+  for (let m = CANDIDATE_FLOOR.month + 1; m <= now.getUTCMonth() + 1; m++) months.push(m);
+  const pad = (v) => String(v).padStart(2, '0');
+
+  log('\nnaming conventions, months after the floor:');
+  for (const m of months) {
+    for (const stem of [
+      `GEDEvent_v26_01_26_${pad(m)}`,   // the floor's own spelling, incremented
+      `GEDEvent_v26_01_26_${m}`,        // unpadded month
+      `GEDEvent_v26_0_${m}`,            // upstream's API version shape
+      `GEDEvent_v26_02_26_${pad(m)}`,   // candidate lineage bumped
+      `GEDEvent_v27_01_26_${pad(m)}`,   // annual lineage bumped
+    ]) {
+      await show(`${stem}.csv`, `${CANDIDATE_DIR}${stem}.csv`);
+    }
+  }
+}
+
+/**
  * Fetch both releases. Injectable so the tests can run without network — the
  * agent shell cannot reach ucdp.uu.se at all.
  */
@@ -503,11 +572,12 @@ export function capWithAnnualFloor(sortedNewestFirst, isCandidate, maxEvents, fl
 // ---- Main ----
 
 function parseArgs(argv) {
-  const out = { out: null, dryRun: false, allowStale: false };
+  const out = { out: null, dryRun: false, allowStale: false, probe: false };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--out') out.out = argv[++i];
     else if (argv[i] === '--dry-run') out.dryRun = true;
     else if (argv[i] === '--allow-stale') out.allowStale = true;
+    else if (argv[i] === '--probe') out.probe = true;
   }
   return out;
 }
@@ -674,8 +744,16 @@ export async function buildMirror({
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+
+  if (args.probe) {
+    console.log('=== UCDP probe: what does ucdp.uu.se actually publish? ===');
+    await probe((line) => console.log(line), new Date());
+    return;
+  }
+
   if (!args.out) {
-    console.error('usage: mirror-ucdp.mjs --out <path.json> [--dry-run]');
+    console.error('usage: mirror-ucdp.mjs --out <path.json> [--dry-run] [--allow-stale]');
+    console.error('       mirror-ucdp.mjs --probe');
     process.exit(2);
   }
 

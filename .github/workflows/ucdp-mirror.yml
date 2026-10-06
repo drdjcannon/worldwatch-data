@@ -29,6 +29,15 @@ on:
     # writes nothing and makes no commit.
     - cron: '0 6 * * 1'
   workflow_dispatch:
+    inputs:
+      probe:
+        description: 'List what UCDP actually publishes, then stop. Nothing is built or committed except the log.'
+        type: boolean
+        default: false
+      allowStale:
+        description: 'Publish even when the newest event is past the 90-day ceiling.'
+        type: boolean
+        default: false
 
 # Two concurrent runs would race on the commit. Never cancel in progress: a
 # half-finished run leaves the published file untouched, which is safe, but
@@ -58,14 +67,38 @@ jobs:
       - name: Test the mirror logic
         run: node --test tools/mirror-ucdp.test.mjs
 
+      # Ground truth about UCDP's filenames, which cannot be got any other way:
+      # ucdp.uu.se is unreachable from the sandbox this repo is maintained from,
+      # so a naming convention can only be guessed there and only measured here.
+      # The output is committed for the same reason the failure log is.
+      - name: Probe what UCDP publishes
+        if: ${{ inputs.probe }}
+        run: |
+          set -o pipefail
+          node tools/mirror-ucdp.mjs --probe 2>&1 | tee /tmp/probe.log
+          git config user.name  'worldwatch-bot'
+          git config user.email 'worldwatch-bot@users.noreply.github.com'
+          mkdir -p ucdp
+          tail -c 16000 /tmp/probe.log > ucdp/last-probe.log
+          git add ucdp/last-probe.log
+          if git diff --cached --quiet; then
+            echo 'Probe output unchanged - nothing to publish.'
+          else
+            git commit -m 'Probe UCDP downloads: publish what it reported'
+            git push
+          fi
+
       - name: Build the mirror
+        if: ${{ !inputs.probe }}
         # Output is teed to a file so a failure can be published. The Actions log
         # itself is not reachable from the agent's sandbox (the log host is not
         # domain-allowlisted), so without this a CI-only failure is undiagnosable
         # from here. Cheap enough to keep permanently.
         run: |
           set -o pipefail
-          node tools/mirror-ucdp.mjs --out "${OUT_PATH}" 2>&1 | tee /tmp/mirror.log
+          ARGS=(--out "${OUT_PATH}")
+          if [ "${{ inputs.allowStale }}" = 'true' ]; then ARGS+=(--allow-stale); fi
+          node tools/mirror-ucdp.mjs "${ARGS[@]}" 2>&1 | tee /tmp/mirror.log
 
       - name: Publish the log if the build failed
         if: failure()
@@ -95,6 +128,7 @@ jobs:
       # which the script's own byte-identical check cannot (there is nothing to
       # compare against on the first run).
       - name: Publish if changed
+        if: ${{ !inputs.probe }}
         run: |
           git config user.name  'worldwatch-bot'
           git config user.email 'worldwatch-bot@users.noreply.github.com'
