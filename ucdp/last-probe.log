@@ -1,0 +1,35 @@
+=== UCDP probe: what does ucdp.uu.se actually publish? ===
+pages:
+  200   137863 B  downloads page
+  200     2568 B  candidateged directory
+
+downloads page mentions 6 GEDEvent filenames:
+  GEDEvent_v26_01_26_06.csv
+  GEDEvent_v26_01_26_06.xlsx
+  GEDEvent_v26_0_7.csv
+  GEDEvent_v26_0_8.csv
+  GEDEvent_v26_1_4_1101_2512.csv
+  GEDEvent_v26_1_4_1101_2512.xlsx
+candidate paths mentioned: candidate, Candidate, se/downloads/candidateged/GEDEvent_v26_0_8, se/downloads/candidateged/GEDevent_v26_0_8, se/downloads/candidateged/ucdp-candidate-codebook1, se/downloads/candidateged/GEDEvent_v26_0_7, se/downloads/candidateged/GEDevent_v26_0_7, se/downloads/candidateged/GEDEvent_v26_01_26_06
+
+naming conventions, months after the floor:
+  404        0 B  GEDEvent_v26_01_26_07.csv
+  404        0 B  GEDEvent_v26_01_26_7.csv
+  200  1353828 B  GEDEvent_v26_0_7.csv
+  404        0 B  GEDEvent_v26_02_26_07.csv
+  404        0 B  GEDEvent_v27_01_26_07.csv
+  404        0 B  GEDEvent_v26_01_26_08.csv
+  404        0 B  GEDEvent_v26_01_26_8.csv
+  200  1436409 B  GEDEvent_v26_0_8.csv
+  404        0 B  GEDEvent_v26_02_26_08.csv
+  404        0 B  GEDEvent_v27_01_26_08.csv
+  404        0 B  GEDEvent_v26_01_26_09.csv
+  404        0 B  GEDEvent_v26_01_26_9.csv
+  404        0 B  GEDEvent_v26_0_9.csv
+  404        0 B  GEDEvent_v26_02_26_09.csv
+  404        0 B  GEDEvent_v27_01_26_09.csv
+  404        0 B  GEDEvent_v26_01_26_10.csv
+  404        0 B  GEDEvent_v26_01_26_10.csv
+  404        0 B  GEDEvent_v26_0_10.csv
+  404        0 B  GEDEvent_v26_02_26_10.csv
+  404        0 B  GEDEvent_v27_01_26_10.csv
