@@ -125,9 +125,31 @@ A run whose output is byte-identical to the published file makes no commit.
 If a run fails, it commits the tail of its own output to `ucdp/last-error.log`.
 Read that first.
 
-**When a new UCDP release lands**, bump `ANNUAL_URL` / `ANNUAL_VERSION` and
-`CANDIDATE_URL` / `CANDIDATE_VERSION` at the top of
-[`tools/mirror-ucdp.mjs`](tools/mirror-ucdp.mjs). The versions are in the URL
-rather than probed, so a stale URL fails the run loudly with a 404 instead of
-quietly publishing last year's data. Check
-[ucdp.uu.se/downloads](https://ucdp.uu.se/downloads/) for the current filenames.
+**A GREEN RUN IS NOT EVIDENCE OF FRESH DATA.** The candidate URL used to be
+hardcoded, on the reasoning that a version UCDP had moved past would 404 and
+fail the run loudly. It does not: the old file keeps serving. The published
+file sat at `newestEventAt 2026-06-30` for **98 days** while this job completed
+successfully every single week, and because the error log is committed only on
+failure the freeze left no artefact at all. Read `generatedAt` and
+`newestEventAt` out of the published file, not the tick in the Actions tab.
+
+Two things now make that failure loud. The candidate release is **probed**
+rather than pinned - six months ending one ahead of the current month, newest
+first, with the last known-good name as the final fallback - and the run
+**fails** when the newest event is over 90 days old. `--allow-stale` publishes
+anyway once you have looked and decided.
+
+**When a new UCDP release lands**, bump `ANNUAL_URL` / `ANNUAL_VERSION`,
+`CANDIDATE_LINEAGE` and `ACD_URL` at the top of
+[`tools/mirror-ucdp.mjs`](tools/mirror-ucdp.mjs). The candidate filenames need
+no edit unless UCDP renames them again - which they did in 2026, from
+`GEDEvent_v26_01_26_06.csv` to `GEDEvent_v26_0_7.csv`, an unpadded month and a
+different shape entirely.
+
+**To find out what UCDP actually publishes**, run the workflow with
+**probe = true**. It fetches the downloads page from CI and commits what it
+found to `ucdp/last-probe.log`: every GEDEvent filename on the page, every
+downloadable it links to, and the result of each name the probe would try. This
+exists because `ucdp.uu.se` is unreachable from the sandbox this repo is
+maintained from and the Actions log host is not allowlisted either, so guessing
+is otherwise the only option - and guessing is what cost 98 days.
