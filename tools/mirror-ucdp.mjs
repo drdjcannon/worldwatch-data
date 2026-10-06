@@ -578,16 +578,25 @@ export function conflictClassification(rows) {
     for (const name of String(row.location || '').split(',')) {
       const country = name.trim();
       if (!country) continue;
-      const entry = byCountry.get(country) ?? { country, level: 0, conflicts: 0 };
+      const entry = byCountry.get(country)
+        ?? { country, level: 0, conflicts: 0, onItsSoil: false };
       entry.level = Math.max(entry.level, level);
       entry.conflicts += 1;
+      // type_of_conflict 3 is intrastate and 4 internationalised intrastate:
+      // both are a civil war fought on this country's territory. 2 is
+      // interstate, where `location` names every STATE PARTY rather than the
+      // battleground - which is how the United Kingdom appeared in the first
+      // published run, on the strength of strikes it carried out in Yemen.
+      if (String(row.type_of_conflict) === '3' || String(row.type_of_conflict) === '4') {
+        entry.onItsSoil = true;
+      }
       byCountry.set(country, entry);
     }
   }
 
   const countries = [...byCountry.values()]
-    .map(({ country, level, conflicts }) => ({
-      country, conflicts, intensity: level === 2 ? 'war' : 'minor',
+    .map(({ country, level, conflicts, onItsSoil }) => ({
+      country, conflicts, intensity: level === 2 ? 'war' : 'minor', onItsSoil,
     }))
     .sort((a, b) => (a.intensity === b.intensity
       ? b.conflicts - a.conflicts

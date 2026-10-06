@@ -570,3 +570,45 @@ test('the classification rides in the payload and is optional', async () => {
   assert.equal(without.conflictClassification, null);
   assert.equal(without.eventCount, 1, 'and the events are unaffected');
 });
+
+test('an interstate conflict names its PARTIES, not its battleground', () => {
+  // Measured 2026-10-06, and it is why `onItsSoil` exists. The first published
+  // run put the United Kingdom in the classification on the strength of this
+  // real row:
+  //   location "United Kingdom, United States of America, Yemen (North Yemen)"
+  //   Government of UK, Government of USA vs Government of Yemen
+  //   type_of_conflict 2
+  // The fighting is in Yemen. "The United Kingdom is in an armed conflict" is
+  // a false impression to leave on a world map.
+  const out = conflictClassification([
+    acd('United Kingdom, United States of America, Yemen (North Yemen)', 2025, 1,
+        { type_of_conflict: '2' }),
+    acd('Yemen (North Yemen)', 2025, 1, { type_of_conflict: '3' }),
+  ]);
+
+  const uk = out.countries.find((c) => c.country === 'United Kingdom');
+  assert.equal(uk.intensity, 'minor', 'the row is still reported');
+  assert.equal(uk.onItsSoil, false, 'but not as a conflict on British soil');
+
+  const yemen = out.countries.find((c) => c.country === 'Yemen (North Yemen)');
+  assert.equal(yemen.onItsSoil, true, 'Yemen hosts an intrastate conflict as well');
+});
+
+test('one intrastate conflict is enough to mark a country as the host', () => {
+  // Israel is in both an interstate conflict with Iran and an intrastate one
+  // with Hamas, so the interstate row must not mask the real answer.
+  const out = conflictClassification([
+    acd('Iran, Israel', 2025, 2, { type_of_conflict: '2' }),
+    acd('Israel', 2025, 2, { type_of_conflict: '3' }),
+  ]);
+  assert.equal(out.countries.find((c) => c.country === 'Israel').onItsSoil, true);
+  assert.equal(out.countries.find((c) => c.country === 'Iran').onItsSoil, false,
+    'this row alone says nothing about fighting inside Iran');
+});
+
+test('internationalised intrastate counts as the host country', () => {
+  // type 4 is a civil war a foreign government has joined. Still a civil war,
+  // still on this country's territory.
+  const out = conflictClassification([acd('Mali', 2025, 2, { type_of_conflict: '4' })]);
+  assert.equal(out.countries[0].onItsSoil, true);
+});
